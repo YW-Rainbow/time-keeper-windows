@@ -1,0 +1,8 @@
+# 사용자 데이터 — 절대 커밋 금지 (CLAUDE.md '반드시 지킨다' 참고)
+state.json
+config.json
+log.csv
+
+# OS
+Thumbs.db
+.DS_Store

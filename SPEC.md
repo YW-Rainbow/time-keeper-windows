@@ -1,4 +1,4 @@
-# 시간지기 — MVP 스펙
+# time-keeper-windows — MVP 스펙
 
 이 문서가 구현의 기준이다. 코드와 어긋나면 이 문서를 먼저 고친다.
 
@@ -9,7 +9,7 @@
 파일 하나로 관리한다. DB를 쓰지 않는다.
 
 ```
-%LOCALAPPDATA%\sigan-jigi\state.json
+%LOCALAPPDATA%\time-keeper-windows\state.json
 ```
 
 ```json
@@ -29,7 +29,7 @@
 설정은 별도 파일로 분리한다.
 
 ```
-%LOCALAPPDATA%\sigan-jigi\config.json
+%LOCALAPPDATA%\time-keeper-windows\config.json
 ```
 
 ```json
@@ -97,7 +97,7 @@
   - `5분만 더` 버튼 — PIN 없이 누를 수 있다. 단, 하루 `max_extensions_per_day`회까지. 누르면 기록에 남는다.
   - `부모 PIN으로 연장` 버튼 — PIN 입력 시 +15 / +30 / +60분
   - `종료` 버튼 — 오버레이 유지 (컴퓨터를 강제 종료시키지 않는다)
-- 연장 횟수를 다 쓰면 `5만분 더` 버튼을 비활성화하고, 남은 방법은 PIN뿐임을 안내한다.
+- 연장 횟수를 다 쓰면 `5분만 더` 버튼을 비활성화하고, 남은 방법은 PIN뿐임을 안내한다.
 
 ### '5분만 더'를 PIN 없이 허용하는 이유
 
@@ -117,7 +117,7 @@
 ## 7. 사용 기록 (CSV)
 
 ```
-%LOCALAPPDATA%\sigan-jigi\log.csv
+%LOCALAPPDATA%\time-keeper-windows\log.csv
 ```
 
 한 줄씩 append. 헤더 포함.

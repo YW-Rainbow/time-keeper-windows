@@ -1,4 +1,4 @@
-# 시간지기 — AI 작업 규칙
+# time-keeper-windows — AI 작업 규칙
 
 이 파일은 Claude Code / Cursor 등 AI 코딩 도구가 이 레포에서 작업할 때 지켜야 할 규칙이다.
 
