@@ -81,6 +81,7 @@ DEFAULT_USER_STATE = {
     "paused": False,
     "pause_started": None,     # ISO 시각
     "last_self_extension": None,  # ISO 시각 — '연속 금지' 판정용
+    "extension_ended": None,   # 주어진 시간이 실제로 다 떨어진 시각 — 재사용 대기의 기준점
 }
 
 CSV_HEADER = ["date", "user", "used_minutes", "limit_minutes",
@@ -136,26 +137,93 @@ class Store:
 
     def load(self, now):
         self.config = load_json(self.config_path, DEFAULT_CONFIG)
-        for key, val in DEFAULT_CONFIG.items():   # 예전 설정 파일에 없는 키는 기본값으로 채움
-            self.config.setdefault(key, json.loads(json.dumps(val)))
-        if not self.config["profiles"]:
-            self.config["profiles"] = json.loads(json.dumps(DEFAULT_CONFIG["profiles"]))
-        for i, p in enumerate(self.config["profiles"], start=1):
-            for key, val in DEFAULT_PROFILE.items():
-                p.setdefault(key, val)
-            p.setdefault("id", f"p{i}")
+        self._sanitize_config()
         self.state = load_json(self.state_path, {"date": "", "current_user": None, "users": {}})
-        self.state.setdefault("date", "")
-        self.state.setdefault("current_user", None)
-        self.state.setdefault("users", {})
+        self._sanitize_state()
         self.rollover(now)
         # 앱이 꺼져 있는 동안 일시정지 자동 재개 시간이 지났으면 정리해 둔다
         for u in self.state["users"].values():
             if u.get("paused") and self._pause_elapsed(u, now) >= self.config["pause_auto_resume_minutes"]:
                 u["paused"], u["pause_started"] = False, None
-        if self.profile(self.state["current_user"]) is None:
-            self.state["current_user"] = None
+        # 앱을 켤 때는 항상 '누가 쓸까요?'부터 다시 묻는다. 이전 사용자를 가정하면
+        # 다른 가족의 시간이 남의 이름으로 기록될 수 있다. (그날의 카운터는 유지된다)
+        self.state["current_user"] = None
         self.save_state()
+
+    # 손으로 고친 파일도 조용히 수습한다(SPEC 3절). 잘못된 값 하나 때문에
+    # 앱이 안 뜨거나 타이머가 멈추는 것보다, 기본값으로 되돌리는 편이 낫다.
+    def _sanitize_config(self):
+        def as_int(v, fallback, lo=0):
+            try:
+                return max(lo, int(v))
+            except (TypeError, ValueError):
+                return fallback
+        c = self.config
+        for key, val in DEFAULT_CONFIG.items():   # 예전 설정 파일에 없는 키는 기본값으로 채움
+            c.setdefault(key, json.loads(json.dumps(val)))
+        if not isinstance(c["parent_pin_hash"], str):
+            c["parent_pin_hash"] = None
+        c["extension_minutes"] = as_int(c["extension_minutes"], 5, lo=1)
+        c["extension_cooldown_minutes"] = as_int(c["extension_cooldown_minutes"], 30)
+        c["pause_auto_resume_minutes"] = as_int(c["pause_auto_resume_minutes"], 30, lo=1)
+        warns = c["warn_at_minutes"] if isinstance(c["warn_at_minutes"], list) else []
+        warns = sorted({as_int(w, 0) for w in warns if as_int(w, 0) > 0}, reverse=True)
+        c["warn_at_minutes"] = warns or list(DEFAULT_CONFIG["warn_at_minutes"])
+        profiles = [p for p in c["profiles"] if isinstance(p, dict)] if isinstance(c["profiles"], list) else []
+        if not profiles:
+            profiles = json.loads(json.dumps(DEFAULT_CONFIG["profiles"]))
+        seen_ids, seen_names = set(), set()
+        for n, p in enumerate(profiles, start=1):
+            for key, val in DEFAULT_PROFILE.items():
+                p.setdefault(key, val)
+            if not isinstance(p.get("id"), str) or p["id"] in seen_ids:
+                p["id"] = self._fresh_id(seen_ids)
+            seen_ids.add(p["id"])
+            p["name"] = str(p["name"]).strip() or f"가족 {n}"
+            while p["name"] in seen_names:   # 이름이 겹치면 기록이 섞인다(CSV가 이름 기준)
+                p["name"] += " 2"
+            seen_names.add(p["name"])
+            if not isinstance(p["pin_hash"], str):
+                p["pin_hash"] = None
+            p["limit_weekday"] = as_int(p["limit_weekday"], 60)
+            p["limit_weekend"] = as_int(p["limit_weekend"], 120)
+            p["max_extensions_per_day"] = as_int(p["max_extensions_per_day"], 3)
+            p["no_limit"] = bool(p["no_limit"])
+            p["allow_consecutive_extensions"] = bool(p["allow_consecutive_extensions"])
+        c["profiles"] = profiles
+
+    @staticmethod
+    def _fresh_id(used):
+        i = 1
+        while f"p{i}" in used:
+            i += 1
+        return f"p{i}"
+
+    def _sanitize_state(self):
+        s = self.state
+        if not isinstance(s.get("date"), str):
+            s["date"] = ""
+        s.setdefault("date", "")
+        users = s.get("users") if isinstance(s.get("users"), dict) else {}
+        clean = {}
+        for pid, u in users.items():
+            base = json.loads(json.dumps(DEFAULT_USER_STATE))
+            if isinstance(u, dict):
+                base.update({k: u[k] for k in base if k in u})
+            for key in ("used_minutes", "extra_minutes", "extensions_self",
+                        "extensions_parent", "pause_minutes"):
+                try:
+                    base[key] = max(0, int(base[key]))
+                except (TypeError, ValueError):
+                    base[key] = 0
+            base["paused"] = bool(base["paused"])
+            for key in ("pause_started", "last_self_extension", "extension_ended"):
+                if not isinstance(base[key], str):
+                    base[key] = None
+            clean[pid] = base
+        s["users"] = clean
+        if not isinstance(s.get("current_user"), str):
+            s["current_user"] = None
 
     # -- 조회 ------------------------------------------------------------
 
@@ -178,7 +246,8 @@ class Store:
 
     def _pause_elapsed(self, u, now):
         try:
-            return (now - datetime.fromisoformat(u["pause_started"])).total_seconds() / 60
+            elapsed = (now - datetime.fromisoformat(u["pause_started"])).total_seconds() / 60
+            return max(0.0, elapsed)  # 시계가 뒤로 보정돼도 표시가 부풀지 않게
         except (TypeError, ValueError):
             return 0
 
@@ -196,11 +265,15 @@ class Store:
         if u["extensions_self"] >= p["max_extensions_per_day"]:
             return False, "no_left", 0
         if not p["allow_consecutive_extensions"] and u["last_self_extension"]:
-            # '연속 금지'의 기준: 직전 5분이 끝난 뒤 대기시간이 지나야 다음 5분을 쓸 수 있다
+            # '연속 금지'의 기준: 직전에 늘린 시간이 실제로 끝난 뒤(extension_ended)
+            # 대기시간이 지나야 다음 5분을 쓸 수 있다. 일시정지로 늦게 끝나면 그만큼 밀린다.
+            # 미래 시각은 now로 클램프 — 시계가 뒤로 보정됐을 때 과대 대기를 막는다.
             try:
-                last = datetime.fromisoformat(u["last_self_extension"])
-                ready = last + timedelta(minutes=self.config["extension_minutes"]
-                                         + self.config["extension_cooldown_minutes"])
+                last = min(now, datetime.fromisoformat(u["last_self_extension"]))
+                ended = last + timedelta(minutes=self.config["extension_minutes"])
+                if u["extension_ended"]:
+                    ended = min(now, datetime.fromisoformat(u["extension_ended"]))
+                ready = ended + timedelta(minutes=self.config["extension_cooldown_minutes"])
                 if now < ready:
                     return False, "cooldown", max(1, round((ready - now).total_seconds() / 60))
             except ValueError:
@@ -240,14 +313,32 @@ class Store:
                               u["extensions_self"], u["extensions_parent"], u["pause_minutes"]])
 
     def _append_csv(self, row):
-        os.makedirs(self.dir, exist_ok=True)
-        is_new = not os.path.exists(self.log_path)
-        # 새 파일만 BOM(utf-8-sig): 엑셀이 한글을 바로 읽는다. 이어쓰기는 BOM 없이.
-        with open(self.log_path, "a", newline="", encoding="utf-8-sig" if is_new else "utf-8") as f:
-            w = csv.writer(f)
-            if is_new:
-                w.writerow(CSV_HEADER)
-            w.writerow(row)
+        # 엑셀이 log.csv를 열어 잠그고 있으면 쓰기가 실패한다. 그 한 줄 때문에
+        # 타이머 전체가 멈추는 것보다 그날 기록을 포기하는 편이 낫다(잃어도 되는 데이터).
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            is_new = not os.path.exists(self.log_path)
+            # 새 파일만 BOM(utf-8-sig): 엑셀이 한글을 바로 읽는다. 이어쓰기는 BOM 없이.
+            with open(self.log_path, "a", newline="", encoding="utf-8-sig" if is_new else "utf-8") as f:
+                w = csv.writer(f)
+                if is_new:
+                    w.writerow(CSV_HEADER)
+                w.writerow(row)
+        except OSError:
+            pass
+
+    def flush_user_today(self, pid):
+        """프로필 삭제 직전 호출: 오늘 기록을 그 시점까지 CSV로 남기고 상태를 지운다.
+        상태를 지워야 나중에 같은 id가 재사용돼도 남의 카운터를 물려받지 않는다."""
+        p, u = self.profile(pid), self.user(pid)
+        if p and any([u["used_minutes"], u["pause_minutes"],
+                      u["extensions_self"], u["extensions_parent"]]):
+            day = date.today()
+            limit = "" if p["no_limit"] else self.limit_on(p, day)
+            self._append_csv([day.isoformat(), p["name"], u["used_minutes"], limit,
+                              u["extensions_self"], u["extensions_parent"], u["pause_minutes"]])
+        self.state["users"].pop(pid, None)
+        self.save_state()
 
     def tick(self, now=None):
         """60초마다 호출. 발생한 사건 문자열을 돌려준다: None | 'auto_resumed'"""
@@ -264,6 +355,10 @@ class Store:
                     event = "auto_resumed"   # 켜두고 잊는 걸 막는 용도. 기록은 남는다
             else:
                 u["used_minutes"] += 1
+                rem = self.remaining(pid, now)
+                if rem is not None and rem <= 0 and u["extension_ended"] is None:
+                    # 주어진 시간이 다 떨어진 시각. '연속 금지' 재사용 대기의 기준점.
+                    u["extension_ended"] = now.isoformat(timespec="seconds")
         self.save_state()
         return event
 
@@ -287,19 +382,27 @@ class Store:
         u["extensions_self"] += 1
         u["extra_minutes"] += self.config["extension_minutes"]
         u["last_self_extension"] = now.isoformat(timespec="seconds")
+        u["extension_ended"] = None   # 새 카운트다운 시작
         self.save_state()
 
     def extend_parent(self, pid, minutes):
         u = self.user(pid)
         u["extensions_parent"] += 1
         u["extra_minutes"] += minutes
+        u["extension_ended"] = None   # 새 카운트다운 시작
         self.save_state()
 
     def save_state(self):
-        save_json_atomic(self.state_path, self.state)
+        try:  # 백신 등이 파일을 순간 잠그면 이번 저장만 건너뛴다. 다음 저장에서 복구된다.
+            save_json_atomic(self.state_path, self.state)
+        except OSError:
+            pass
 
     def save_config(self):
-        save_json_atomic(self.config_path, self.config)
+        try:
+            save_json_atomic(self.config_path, self.config)
+        except OSError:
+            pass
 
     # -- 대시보드용 조회 ---------------------------------------------------
 
@@ -513,7 +616,10 @@ class RemainWidget:
     def menu(self, event):
         s = self.app.store
         pid = s.state["current_user"]
-        m = tk.Menu(self.win, tearoff=0)
+        m = getattr(self, "_menu", None)
+        if m is None:   # 상시 실행 앱이라 우클릭마다 새로 만들면 몇 주 새 누적된다
+            m = self._menu = tk.Menu(self.win, tearoff=0)
+        m.delete(0, "end")
         if pid and s.profile(pid):
             rem = s.remaining(pid)
             if s.user(pid)["paused"]:
@@ -561,9 +667,13 @@ class Picker:
 
     def choose(self, pid):
         p = self.app.store.profile(pid)
+        if p is None:   # 이 창이 떠 있는 동안 설정에서 프로필이 지워진 경우
+            self.win.destroy()
+            self.app.show_picker()
+            return
         if p["pin_hash"]:
             ok = ask_pin(self.app.root, f"{p['name']}의 PIN",
-                         "본인 확인용이에요. 4자리 숫자를 입력해 주세요.",
+                         "본인 확인용이에요. 만들 때 정한 PIN을 입력해 주세요.",
                          verify=lambda s: verify_pin(s, p["pin_hash"]))
             if ok is None:
                 return
@@ -584,7 +694,9 @@ class Overlay:
         x, y, w, h = virtual_screen()
         if not w:  # 윈도우가 아니면 주 화면 크기로 (-fullscreen은 창 관리자에 의존해서 안 쓴다)
             x, y, w, h = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        # CTk의 geometry()는 크기에 DPI 배율을 한 번 더 곱한다. 이미 물리 픽셀이므로
+        # wm_geometry로 우회해야 125%/150% 화면에서도 정확히 전체를 덮는다.
+        self.win.wm_geometry(f"{w}x{h}+{x}+{y}")
         self.win.configure(fg_color=C["bg"])
         box = ctk.CTkFrame(self.win, fg_color="transparent")
         box.place(relx=0.5, rely=0.5, anchor="center")
@@ -612,6 +724,7 @@ class Overlay:
                                       border_color=C["border"], hover_color=C["border"],
                                       command=self.done)
         self.btn_done.pack(pady=5)
+        self.done_mode = False
         self.refresh()
 
     def refresh(self):
@@ -620,7 +733,8 @@ class Overlay:
         if not pid or not s.profile(pid):
             return
         p, u = s.profile(pid), s.user(pid)
-        self.sub.configure(text=f"{p['name']} · 오늘 {u['used_minutes']}분 사용했어요")
+        if not self.done_mode:   # '오늘은 여기까지'를 누른 뒤에는 인사말을 유지한다
+            self.sub.configure(text=f"{p['name']} · 오늘 {u['used_minutes']}분 사용했어요")
         ok, why, wait = s.can_extend_self(pid)
         left = p["max_extensions_per_day"] - u["extensions_self"]
         if ok:
@@ -649,7 +763,7 @@ class Overlay:
             return
         ok = ask_pin(self.app.root, "부모 PIN", "연장할 시간을 고를 수 있어요.",
                      verify=lambda x: verify_pin(x, s.config["parent_pin_hash"]))
-        if ok is None:
+        if ok is None or not self.win.winfo_exists():   # 입력 중 자정이 지나 창이 닫힌 경우
             return
         for w in self.pinrow.winfo_children():
             w.destroy()
@@ -666,6 +780,7 @@ class Overlay:
     def done(self):
         # 컴퓨터를 강제로 끄지 않는다. 화면은 그대로 덮여 있고,
         # 부모 PIN 연장과 사용자 바꾸기는 계속 쓸 수 있다.
+        self.done_mode = True
         self.title.configure(text="오늘도 수고했어요")
         self.sub.configure(text="내일 다시 만나요.")
 
@@ -705,6 +820,10 @@ class Dashboard:
         self.win.bind("<Configure>", lambda e: self.draw_chart() if e.widget is self.win else None)
 
     def refresh(self):
+        names = [p["name"] for p in self.app.store.config["profiles"]]
+        self.who.configure(values=names)   # 개명·추가·삭제를 따라간다
+        if self.who.get() not in names:
+            self.who.set(names[0])
         for w in self.today_box.winfo_children():
             w.destroy()
         s = self.app.store
@@ -758,7 +877,7 @@ class Dashboard:
         maxv = max([v for _, v, _ in series] + [60])
         n = len(series)
         plot_w, plot_h = w - pl - pr, h - pt - pb
-        # 눈금 두 줄이면 충분하다. 차트 라이브러리를 쓰지 않는 이유: SPEC 9절(대시보드).
+        # 눈금 두 줄이면 충분하다. 차트 라이브러리를 쓰지 않는 이유: SPEC 10절(기록 보기).
         for frac in (0.5, 1.0):
             y = h - pb - plot_h * frac
             cv.create_line(pl, y, w - pr, y, fill=C["border"])
@@ -802,6 +921,8 @@ class Settings:
         self.win.geometry("900x560")
         self.win.configure(fg_color=C["bg"])
         self.win.attributes("-topmost", True)
+        # X로 닫아도 저장으로 취급한다. 추가·삭제·PIN이 반쯤만 적용된 채 남는 걸 막는다.
+        self.win.protocol("WM_DELETE_WINDOW", self.save)
         head = ctk.CTkFrame(self.win, fg_color="transparent")
         head.pack(fill="x", padx=20, pady=(16, 2))
         cols = [("이름", 130), ("평일(분)", 70), ("주말(분)", 70), ("한도 없음", 80),
@@ -858,11 +979,8 @@ class Settings:
 
     def add_profile(self):
         s = self.app.store
-        used_ids = {p["id"] for p in s.config["profiles"]}
-        i = 1
-        while f"p{i}" in used_ids:
-            i += 1
-        p = dict(DEFAULT_PROFILE, id=f"p{i}", name=f"가족 {i}")
+        pid = Store._fresh_id({p["id"] for p in s.config["profiles"]})
+        p = dict(DEFAULT_PROFILE, id=pid, name=f"가족 {pid[1:]}")
         s.config["profiles"].append(p)
         self.add_row(p)
 
@@ -871,6 +989,7 @@ class Settings:
             return  # 최소 한 명은 남긴다
         row.destroy()
         s = self.app.store
+        s.flush_user_today(p["id"])   # 오늘 기록을 남기고 상태를 지운다 (id 재사용 대비)
         s.config["profiles"] = [x for x in s.config["profiles"] if x["id"] != p["id"]]
         if s.state["current_user"] == p["id"]:
             s.state["current_user"] = None
@@ -881,14 +1000,16 @@ class Settings:
                 parent=self.win):
             p["pin_hash"] = None
             self.app.store.save_config()
-            btn.configure(text="만들기")
+            if btn.winfo_exists():
+                btn.configure(text="만들기")
             return
         pin = ask_pin(self.app.root, f"{p['name']}의 PIN", "4자리 숫자를 추천해요.",
                       confirm_new=True)
         if pin is not None:
             p["pin_hash"] = hash_pin(pin)
             self.app.store.save_config()
-            btn.configure(text="변경·삭제")
+            if btn.winfo_exists():   # PIN 입력 중 설정 창이 닫혔을 수 있다
+                btn.configure(text="변경·삭제")
 
     def change_parent_pin(self):
         s = self.app.store
@@ -922,10 +1043,19 @@ class Settings:
             p["no_limit"] = bool(nolim.get())
             p["max_extensions_per_day"] = to_int(ext, p["max_extensions_per_day"])
             p["allow_consecutive_extensions"] = bool(consec.get())
+        names = [p["name"] for p in self.app.store.config["profiles"]]
+        if len(names) != len(set(names)):
+            # CSV가 이름 기준이라 이름이 겹치면 두 사람의 기록이 섞인다
+            messagebox.showinfo(APP_ID, "이름이 서로 같은 가족이 있어요.\n각자 다른 이름으로 정해 주세요.",
+                                parent=self.win)
+            return
         self.app.store.save_config()
         self.app.store.save_state()
         self.win.destroy()
+        self.app.check_time()   # 한도가 바뀌었으면 오버레이도 즉시 따라간다
         self.app.refresh_all()
+        if self.app.picker is not None and self.app.picker.win.winfo_exists():
+            self.app.show_picker()   # 열려 있는 선택 창에 개명·추가·삭제를 반영
 
 # ── 자동 실행: shell:startup 바로가기. 몰래 등록하지 않는다 ─────────────────
 
@@ -975,27 +1105,30 @@ class App:
         self.overlay = None
         self.dashboard = None
         self.picker = None
+        self.settings = None
         self.warned = {}       # {pid: 지나간 경고 시점들} — 같은 시점 중복 알림 금지
         self.widget = RemainWidget(self)
-        if self.store.state["current_user"] is None:
-            self.show_picker()
+        self.show_picker()     # 시작할 때는 항상 묻는다. 이전 사용자를 가정하지 않는다.
         self.check_time()
         self.root.after(60_000, self.tick)
 
     # -- 시간 흐름 ---------------------------------------------------------
 
     def tick(self):
-        rolled = self.store.state["date"] != datetime.now().date().isoformat()
-        event = self.store.tick()
-        if rolled:
-            self.warned.clear()
-            self.close_overlay()
-            self.show_picker()
-        if event == "auto_resumed":
-            self.banner.show(f"일시정지 {self.store.config['pause_auto_resume_minutes']}분이 지나서 다시 시작했어요.")
-        self.check_time()
-        self.refresh_all()
-        self.root.after(60_000, self.tick)
+        try:
+            rolled = self.store.state["date"] != datetime.now().date().isoformat()
+            event = self.store.tick()
+            if rolled:
+                self.warned.clear()
+                self.close_overlay()
+                self.show_picker()
+            if event == "auto_resumed":
+                self.banner.show(f"일시정지 {self.store.config['pause_auto_resume_minutes']}분이 지나서 다시 시작했어요.")
+            self.check_time()
+            self.refresh_all()
+        finally:
+            # 무슨 일이 있어도 다음 틱은 잡아 둔다. 이 예약이 끊기면 앱 전체가 조용히 멈춘다.
+            self.root.after(60_000, self.tick)
 
     def check_time(self):
         s = self.store
@@ -1053,16 +1186,19 @@ class App:
     # -- 창 관리 ------------------------------------------------------------
 
     def show_picker(self):
+        if self.root.grab_current() is not None:
+            return  # PIN 카드 위를 topmost 창으로 덮으면 화면이 잠긴 것처럼 보인다
         if self.picker is not None and self.picker.win.winfo_exists():
-            self.picker.win.lift()
-        else:
-            self.picker = Picker(self)
+            self.picker.win.destroy()   # lift 대신 재생성: '오늘 N분' 숫자를 새로 채운다
+        self.picker = Picker(self)
 
     def show_overlay(self):
-        if self.overlay is None or not self.overlay.win.winfo_exists():
-            self.overlay = Overlay(self)
-        else:
+        if self.overlay is not None and self.overlay.win.winfo_exists():
             self.overlay.refresh()
+            return
+        if self.root.grab_current() is not None:
+            return  # PIN 입력 중에는 만들지 않는다. 다음 틱(1분 안)에 다시 시도된다.
+        self.overlay = Overlay(self)
 
     def close_overlay(self):
         if self.overlay is not None:
@@ -1077,7 +1213,11 @@ class App:
             self.dashboard = Dashboard(self)
 
     def show_settings(self):
-        Settings(self)
+        w = getattr(self.settings, "win", None)
+        if w is not None and w.winfo_exists():
+            w.lift()   # 같은 설정을 두 창에서 고치면 마지막 저장이 이겨버린다
+            return
+        self.settings = Settings(self)
 
     def refresh_all(self):
         self.widget.refresh()
@@ -1092,8 +1232,10 @@ def already_running():
     # 두 개가 돌면 시간이 두 배로 깎인다. 숨기려는 게 아니라 이중 카운트 방지용.
     if not IS_WINDOWS:
         return False
-    ctypes.windll.kernel32.CreateMutexW(None, False, f"{APP_ID}-single-instance")
-    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    # windll.GetLastError()는 ctypes 내부 호출이 값을 덮을 수 있어 신뢰할 수 없다
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW(None, False, f"{APP_ID}-single-instance")
+    return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 
 
 def main():
