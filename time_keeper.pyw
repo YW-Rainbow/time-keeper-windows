@@ -613,7 +613,10 @@ class RemainWidget:
         self.app = app
         self.win = ctk.CTkToplevel(app.root)
         frameless(self.win)
-        # 닫기·숨기기 기능을 만들지 않는다(CLAUDE.md). 창 장식이 없으니 X 버튼도 없다.
+        # 닫기·숨기기 기능을 만들지 않는다(CLAUDE.md). 창 장식이 없으니 X 버튼도 없고,
+        # Alt+F4로도 닫히지 않게 막는다. 위젯만 닫히고 프로그램은 백그라운드에 남으면
+        # '보이지도 않고 새로 켜지지도 않는' 상태가 된다 — 항상 보이는 것이 핵심 기능이라 이걸 막는다.
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
         self.card = ctk.CTkFrame(self.win, corner_radius=19, fg_color=C["card"],
                                  border_width=1, border_color=C["border"])
         self.card.pack(padx=2, pady=2)
@@ -1231,8 +1234,10 @@ class App:
             if datetime.now() >= self.winddown_until:
                 self.close_winddown()
                 sleep_pc()   # 정해둔 시간이 지나면 절전. 아이가 고른 마무리의 일부다(강제 아님).
-            elif self.winddown is not None and self.winddown.win.winfo_exists():
+            else:
                 self.close_overlay()   # 마무리 중에는 화면을 열어 둔다(저장·정리)
+                if self.winddown is None or not self.winddown.win.winfo_exists():
+                    self.winddown = WindDown(self)   # 닫혔으면 되살린다
                 self.winddown.refresh()
             return
         pid = s.state["current_user"]
@@ -1352,7 +1357,12 @@ class App:
         self.settings = Settings(self)
 
     def refresh_all(self):
-        self.widget.refresh()
+        # 무슨 이유로든 위젯이 사라지면 되살린다. 항상 보이는 것이 이 앱의 핵심 기능이라,
+        # 위젯이 없는 채로 프로그램만 도는 상태를 두지 않는다.
+        if not self.widget.win.winfo_exists():
+            self.widget = RemainWidget(self)
+        else:
+            self.widget.refresh()
         if self.overlay is not None and self.overlay.win.winfo_exists():
             self.overlay.refresh()
         if self.winddown is not None and self.winddown.win.winfo_exists():
@@ -1383,7 +1393,14 @@ def main():
     if already_running():
         root = tk.Tk()
         root.withdraw()
-        messagebox.showinfo(APP_ID, "이미 실행되고 있어요. 화면 위의 위젯을 확인해 주세요.")
+        # 위젯이 안 보이는데 이 메시지가 뜨면, 이전 실행이 백그라운드에 남은 것이다.
+        # 이 앱은 작업표시줄에 안 뜨고 작업관리자의 '자세히' 탭에만 pythonw.exe로 보이므로
+        # 어디서 끝내야 하는지 구체적으로 안내한다.
+        messagebox.showinfo(APP_ID,
+                            "이미 실행되고 있어요. 화면 오른쪽 위의 위젯을 확인해 주세요.\n\n"
+                            "위젯이 보이지 않으면 이전 프로그램이 백그라운드에 남아 있을 수 있어요.\n"
+                            "작업 관리자(Ctrl+Shift+Esc)의 '자세히' 탭에서 pythonw.exe를 끝낸 뒤\n"
+                            "다시 실행해 주세요.")
         return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
