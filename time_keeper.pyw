@@ -67,6 +67,9 @@ DEFAULT_CONFIG = {
     "extension_minutes": 5,
     "extension_cooldown_minutes": 30,    # '연속 금지'일 때 다음 5분까지 기다리는 시간
     "pause_auto_resume_minutes": 30,
+    "winddown_sleep_minutes": 5,         # '오늘은 여기까지' 후 자동 절전까지의 시간
+    "widget_right": None,                # 위젯 위치 기억(오른쪽 끝 x). None이면 우측 상단 기본값
+    "widget_y": None,
     "profiles": [
         dict(DEFAULT_PROFILE, id=f"p{i}", name=f"가족 {i}") for i in range(1, 6)
     ],
@@ -166,6 +169,10 @@ class Store:
         c["extension_minutes"] = as_int(c["extension_minutes"], 5, lo=1)
         c["extension_cooldown_minutes"] = as_int(c["extension_cooldown_minutes"], 30)
         c["pause_auto_resume_minutes"] = as_int(c["pause_auto_resume_minutes"], 30, lo=1)
+        c["winddown_sleep_minutes"] = as_int(c["winddown_sleep_minutes"], 5, lo=1)
+        for key in ("widget_right", "widget_y"):   # 위젯 위치: 정수 또는 None
+            if not isinstance(c[key], int) or isinstance(c[key], bool):
+                c[key] = None
         warns = c["warn_at_minutes"] if isinstance(c["warn_at_minutes"], list) else []
         warns = sorted({as_int(w, 0) for w in warns if as_int(w, 0) > 0}, reverse=True)
         c["warn_at_minutes"] = warns or list(DEFAULT_CONFIG["warn_at_minutes"])
@@ -487,6 +494,25 @@ def primary_screen():
     return None, None
 
 
+def sleep_pc():
+    # 절전(대기 모드). 되돌릴 수 있는 부드러운 방식이라 최대절전·종료 대신 이걸 쓴다.
+    # 시간이 됐다고 앱이 멋대로 부르지 않는다 — 아이가 '오늘은 여기까지'를 고른 뒤에만.
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.powrprof.SetSuspendState(0, 1, 0)  # bHibernate=0 → 절전
+        except OSError:
+            pass
+
+
+def shutdown_pc():
+    # 정상 종료. 아이가 '지금 컴퓨터 끄기'를 직접 누른 경우에만 부른다(강제 아님).
+    if IS_WINDOWS:
+        try:
+            subprocess.run(["shutdown", "/s", "/t", "0"], creationflags=0x08000000)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def overlay_content_pos(virtual, primary):
     """오버레이 창(가상 화면 전체) 안에서 내용 상자를 놓을 상대 위치 (relx, rely).
     듀얼 모니터에서 두 화면 경계에 버튼이 걸리지 않도록 주 모니터 중앙을 가리킨다.
@@ -598,15 +624,27 @@ class RemainWidget:
         for w in (self.card, self.label):
             w.bind("<Button-3>", self.menu)
             w.bind("<Double-Button-1>", lambda e: self.app.show_dashboard())
-        # 문구 길이가 바뀌어도 오른쪽 끝을 기준으로 제자리에 붙어 있게 앵커를 기억한다
-        self._right = self.win.winfo_screenwidth() - 16
-        self._y = 16
+            w.bind("<ButtonRelease-1>", self._persist)   # 옮긴 자리를 기억한다
+        # 문구 길이가 바뀌어도 오른쪽 끝을 기준으로 제자리에 붙어 있게 앵커를 기억한다.
+        # 지난번에 옮긴 자리가 있으면 거기서 시작하고, 없으면 우측 상단 기본값.
+        cfg = self.app.store.config
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self._right = cfg["widget_right"] if cfg["widget_right"] is not None else sw - 16
+        self._y = cfg["widget_y"] if cfg["widget_y"] is not None else 16
+        self._right = min(max(60, self._right), sw)      # 화면 밖으로 나가지 않게 살짝 조인다
+        self._y = min(max(0, self._y), max(0, sh - 40))
         self.refresh()
 
     def _save_anchor(self):
         self.win.update_idletasks()
         self._right = self.win.winfo_x() + self.win.winfo_width()
         self._y = self.win.winfo_y()
+
+    def _persist(self, _=None):
+        self._save_anchor()
+        cfg = self.app.store.config
+        cfg["widget_right"], cfg["widget_y"] = self._right, self._y
+        self.app.store.save_config()
 
     def refresh(self):
         s = self.app.store
@@ -749,9 +787,8 @@ class Overlay:
         self.btn_done = ctk.CTkButton(box, text="오늘은 여기까지", font=f(14), height=40, width=300,
                                       corner_radius=12, fg_color="transparent", border_width=1,
                                       border_color=C["border"], hover_color=C["border"],
-                                      command=self.done)
+                                      command=self.app.start_winddown)
         self.btn_done.pack(pady=5)
-        self.done_mode = False
         self.refresh()
 
     def refresh(self):
@@ -760,8 +797,7 @@ class Overlay:
         if not pid or not s.profile(pid):
             return
         p, u = s.profile(pid), s.user(pid)
-        if not self.done_mode:   # '오늘은 여기까지'를 누른 뒤에는 인사말을 유지한다
-            self.sub.configure(text=f"{p['name']} · 오늘 {u['used_minutes']}분 사용했어요")
+        self.sub.configure(text=f"{p['name']} · 오늘 {u['used_minutes']}분 사용했어요")
         ok, why, wait = s.can_extend_self(pid)
         left = p["max_extensions_per_day"] - u["extensions_self"]
         if ok:
@@ -804,12 +840,40 @@ class Overlay:
         s.extend_parent(s.state["current_user"], minutes)
         self.app.after_extension()
 
-    def done(self):
-        # 컴퓨터를 강제로 끄지 않는다. 화면은 그대로 덮여 있고,
-        # 부모 PIN 연장과 사용자 바꾸기는 계속 쓸 수 있다.
-        self.done_mode = True
-        self.title.configure(text="오늘도 수고했어요")
-        self.sub.configure(text="내일 다시 만나요.")
+    def destroy(self):
+        if self.win.winfo_exists():
+            self.win.destroy()
+
+
+# ── 마무리 안내 ('오늘은 여기까지' 후) ─────────────────────────────────────
+
+class WindDown:
+    """아이가 '오늘은 여기까지'를 직접 고른 뒤의 부드러운 마무리.
+    강제 종료가 아니다 — 화면은 열어 두어 저장·정리할 수 있고, '지금 컴퓨터 끄기'로
+    스스로 끌 수 있으며, 정해둔 시간(기본 5분) 안에 끄지 않으면 절전으로 넘어간다."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = ctk.CTkToplevel(app.root)
+        frameless(self.win)
+        card = ctk.CTkFrame(self.win, corner_radius=16, fg_color=C["card"],
+                            border_width=1, border_color=C["accent"])
+        card.pack(padx=2, pady=2)
+        self.label = ctk.CTkLabel(card, text="", font=f(14), text_color=C["text"], justify="center")
+        self.label.pack(padx=22, pady=(14, 8))
+        ctk.CTkButton(card, text="지금 컴퓨터 끄기", font=f(13, True), width=200, height=40,
+                      command=self.app.shutdown_now).pack(padx=22, pady=(0, 14))
+        make_draggable(self.win, card, self.label)
+        self.win.update_idletasks()
+        x = (self.win.winfo_screenwidth() - self.win.winfo_reqwidth()) // 2
+        self.win.geometry(f"+{max(0, x)}+24")
+        self.refresh()
+
+    def refresh(self):
+        left = self.app.winddown_left()
+        self.label.configure(text="오늘은 여기까지예요. 저장할 게 있으면 지금 정리해 주세요.\n"
+                                  f"{left}분 뒤에 컴퓨터가 저절로 절전돼요.")
+        self.win.attributes("-topmost", True)
 
     def destroy(self):
         if self.win.winfo_exists():
@@ -1133,6 +1197,8 @@ class App:
         self.dashboard = None
         self.picker = None
         self.settings = None
+        self.winddown = None
+        self.winddown_until = None   # '오늘은 여기까지' 후 절전까지 남은 시각
         self.warned = {}       # {pid: 지나간 경고 시점들} — 같은 시점 중복 알림 금지
         self.widget = RemainWidget(self)
         self.show_picker()     # 시작할 때는 항상 묻는다. 이전 사용자를 가정하지 않는다.
@@ -1147,6 +1213,7 @@ class App:
             event = self.store.tick()
             if rolled:
                 self.warned.clear()
+                self.close_winddown()
                 self.close_overlay()
                 self.show_picker()
             if event == "auto_resumed":
@@ -1159,6 +1226,15 @@ class App:
 
     def check_time(self):
         s = self.store
+        # '오늘은 여기까지' 마무리 중이면 그 흐름을 우선한다.
+        if self.winddown_until is not None:
+            if datetime.now() >= self.winddown_until:
+                self.close_winddown()
+                sleep_pc()   # 정해둔 시간이 지나면 절전. 아이가 고른 마무리의 일부다(강제 아님).
+            elif self.winddown is not None and self.winddown.win.winfo_exists():
+                self.close_overlay()   # 마무리 중에는 화면을 열어 둔다(저장·정리)
+                self.winddown.refresh()
+            return
         pid = s.state["current_user"]
         if not pid or not s.profile(pid) or s.profile(pid)["no_limit"]:
             self.close_overlay()
@@ -1180,16 +1256,45 @@ class App:
     # -- 사용자 동작 --------------------------------------------------------
 
     def select_user(self, pid):
+        self.close_winddown()
         self.store.select_user(pid)
         self.warned.pop(pid, None)
         self.check_time()
         self.refresh_all()
 
     def switch_user(self):
+        self.close_winddown()
         self.store.select_user(None)
         self.close_overlay()
         self.refresh_all()
         self.show_picker()
+
+    # -- '오늘은 여기까지' 마무리 --------------------------------------------
+
+    def start_winddown(self):
+        mins = self.store.config["winddown_sleep_minutes"]
+        self.winddown_until = datetime.now() + timedelta(minutes=mins)
+        self.close_overlay()   # 화면을 열어 준다 — 저장·정리하고 직접 끌 수 있게
+        if self.winddown is None or not self.winddown.win.winfo_exists():
+            self.winddown = WindDown(self)
+        else:
+            self.winddown.refresh()
+
+    def winddown_left(self):
+        if not self.winddown_until:
+            return 0
+        secs = (self.winddown_until - datetime.now()).total_seconds()
+        return max(0, int((secs + 59) // 60))   # 분 단위 올림
+
+    def shutdown_now(self):
+        self.close_winddown()
+        shutdown_pc()
+
+    def close_winddown(self):
+        self.winddown_until = None
+        if self.winddown is not None:
+            self.winddown.destroy()
+            self.winddown = None
 
     def pause(self):
         pid = self.store.state["current_user"]
@@ -1250,6 +1355,8 @@ class App:
         self.widget.refresh()
         if self.overlay is not None and self.overlay.win.winfo_exists():
             self.overlay.refresh()
+        if self.winddown is not None and self.winddown.win.winfo_exists():
+            self.winddown.refresh()
         if self.dashboard is not None and self.dashboard.win.winfo_exists():
             self.dashboard.refresh()
 
