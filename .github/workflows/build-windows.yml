@@ -13,7 +13,12 @@
 name: build-windows
 
 on:
-  workflow_dispatch:        # 수동 실행
+  workflow_dispatch:        # 수동 실행 (Actions 탭에서 버전 입력 후 Run)
+    inputs:
+      version:
+        description: "릴리스 버전 (예: v0.1.0). 이 이름으로 태그와 릴리스를 만든다."
+        default: "v0.1.0"
+        required: true
   push:
     tags:
       - "v*"                 # 버전 태그를 올리면 자동 빌드+릴리스
@@ -51,13 +56,19 @@ jobs:
           path: dist/time-keeper-windows.exe
           if-no-files-found: error
 
-      - name: 릴리스에 첨부 (태그 푸시일 때만)
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: 릴리스에 첨부 (태그 푸시 또는 수동 실행)
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          # 태그 푸시면 그 태그를, 수동 실행이면 입력한 버전을 쓴다.
+          # gh release create는 태그가 없으면 GitHub 서버에서 만들어 준다(로컬 태그 푸시 불필요).
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
           NOTES="다운로드해 바로 실행하는 단일 exe입니다. 파이썬 설치가 필요 없습니다.
 
           처음 실행 시 'Windows의 PC 보호' 경고가 뜨면 '추가 정보 → 실행'을 눌러 주세요.
@@ -66,5 +77,5 @@ jobs:
             gh release upload "$TAG" dist/time-keeper-windows.exe --clobber
           else
             gh release create "$TAG" dist/time-keeper-windows.exe \
-              --title "time-keeper-windows $TAG" --notes "$NOTES"
+              --target "$GITHUB_SHA" --title "time-keeper-windows $TAG" --notes "$NOTES"
           fi
