@@ -1171,16 +1171,22 @@ def set_autostart(enable):
             if os.path.exists(lnk):
                 os.remove(lnk)
             return True, ""
-        script = os.path.abspath(__file__)
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        target = pyw if os.path.exists(pyw) else sys.executable
+        if getattr(sys, "frozen", False):
+            # exe로 빌드된 경우: 실행 파일이 곧 진입점이라 스크립트 인자가 필요 없다.
+            target, arguments, workdir = sys.executable, "", os.path.dirname(sys.executable)
+        else:
+            # .pyw로 실행: pythonw.exe가 스크립트를 열게 한다(콘솔 창 없이).
+            script = os.path.abspath(__file__)
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            target = pyw if os.path.exists(pyw) else sys.executable
+            arguments, workdir = f'"{script}"', os.path.dirname(script)
         # 레지스트리 대신 시작프로그램 폴더: 사용자가 눈으로 확인하고 지울 수 있다.
         q = lambda t: t.replace("'", "''")
         ps = (f"$ws = New-Object -ComObject WScript.Shell; "
               f"$s = $ws.CreateShortcut('{q(lnk)}'); "
               f"$s.TargetPath = '{q(target)}'; "
-              f"$s.Arguments = '\"{q(script)}\"'; "
-              f"$s.WorkingDirectory = '{q(os.path.dirname(script))}'; "
+              f"$s.Arguments = '{q(arguments)}'; "
+              f"$s.WorkingDirectory = '{q(workdir)}'; "
               f"$s.Save()")
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
                        check=True, capture_output=True, creationflags=0x08000000)

@@ -64,5 +64,10 @@ SPEC.md에 없는 기능을 임의로 추가하지 않는다. 필요하다고 �
 ## 기술 스택
 
 **확정 (2026-07-29):** Python 3.10+ / tkinter + customtkinter.
-exe를 만들지 않는다 — `.pyw` + 시작프로그램 바로가기로 배포해 백신 오탐을 회피한다.
 저장은 JSON + CSV. DB(SQLite 포함)를 쓰지 않는다.
+
+**배포 (2026-07-30 갱신):** 원래 "exe 안 만듦"이었으나, "설치 없이 다운로드해 쓰고 싶다"는
+요구로 **단일 exe(PyInstaller)** 를 추가했다. 서명 없는 exe의 SmartScreen·오탐 트레이드오프를
+사용자가 알고 결정. 빌드는 GitHub Actions 윈도우 러너(`.github/workflows/build-windows.yml`)가
+하고 Releases에 올린다. `.pyw` 직접 실행 경로도 유지한다. 코드에서 `sys.frozen`을 감지해
+자동 실행 등록 대상을 exe/파이썬에 맞게 분기한다.

@@ -1,0 +1,70 @@
+# 윈도우 단일 exe를 빌드해 Releases에 올린다.
+# 리눅스에선 윈도우 exe를 못 만들기 때문에, 빌드는 GitHub의 windows 러너에 맡긴다.
+#
+# 쓰는 법
+#  - 그냥 빌드만 받아보기: Actions 탭 → 이 워크플로 → "Run workflow"(수동 실행).
+#    끝나면 Artifacts에서 exe를 내려받는다.
+#  - 정식 배포: 버전 태그를 올리면(예: git tag v0.1.0 && git push origin v0.1.0)
+#    자동으로 빌드해 그 태그의 Release에 exe를 첨부한다.
+#
+# 참고: 서명하지 않은 exe라 처음 실행 시 SmartScreen 경고가 뜰 수 있다(추가 정보 → 실행).
+# 코드 서명 인증서는 유료라 가정용에는 넣지 않는다. 이 트레이드오프는 SPEC 1절에 적어 둠.
+
+name: build-windows
+
+on:
+  workflow_dispatch:        # 수동 실행
+  push:
+    tags:
+      - "v*"                 # 버전 태그를 올리면 자동 빌드+릴리스
+
+permissions:
+  contents: write            # 릴리스에 exe를 첨부하려면 필요
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        run: python -m pip install --upgrade pip customtkinter pyinstaller
+
+      - name: exe 빌드
+        # onefile: 단일 exe / windowed: 콘솔 창 없음(pythonw처럼)
+        # collect-all: customtkinter의 테마·에셋 파일과 darkdetect를 exe 안에 함께 담는다
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name time-keeper-windows
+          --collect-all customtkinter
+          --collect-all darkdetect
+          time_keeper.pyw
+
+      - name: 빌드 결과 업로드 (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: time-keeper-windows-exe
+          path: dist/time-keeper-windows.exe
+          if-no-files-found: error
+
+      - name: 릴리스에 첨부 (태그 푸시일 때만)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          NOTES="다운로드해 바로 실행하는 단일 exe입니다. 파이썬 설치가 필요 없습니다.
+
+          처음 실행 시 'Windows의 PC 보호' 경고가 뜨면 '추가 정보 → 실행'을 눌러 주세요.
+          (서명하지 않은 exe라 생기는 안내이며, 앱이 하는 일은 SPEC.md에 전부 공개되어 있습니다.)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/time-keeper-windows.exe --clobber
+          else
+            gh release create "$TAG" dist/time-keeper-windows.exe \
+              --title "time-keeper-windows $TAG" --notes "$NOTES"
+          fi

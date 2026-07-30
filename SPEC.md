@@ -12,8 +12,17 @@
 
 - Python 3.10+ / tkinter + **customtkinter** — customtkinter는 유일한 외부 패키지.
   "투박하지 않은 디자인" 요구로 표준 라이브러리 원칙에 사용자가 승인한 예외다.
-- 실행은 `time_keeper.pyw` 더블클릭(pythonw, 콘솔 창 없음). **exe를 만들지 않는다.**
-  서명 없는 exe의 백신 오탐 문제를 통째로 회피하기 위한 선택이다.
+- 배포 방식은 두 가지 (2026-07-30 결정으로 exe를 추가):
+  1. **단일 exe** — PyInstaller로 빌드한 `time-keeper-windows.exe`. 파이썬 설치 없이
+     다운로드해 바로 실행. 가족 PC에 나눠주기 편하다. 빌드는 GitHub Actions의 윈도우
+     러너가 하고 Releases에 올린다(`.github/workflows/build-windows.yml`).
+     - **트레이드오프**: 서명하지 않은 exe라 첫 실행 시 SmartScreen 경고가 뜰 수 있고
+       백신 오탐 가능성이 있다. 코드 서명 인증서는 유료라 넣지 않는다. 원래 이 문제를
+       피하려 `.pyw`만 쓰기로 했었으나, "설치 없이 다운로드해 쓰고 싶다"는 요구로 exe를
+       택했다(사용자가 트레이드오프를 알고 결정). 앱이 하는 일은 전부 공개되어 있어,
+       경고가 떠도 소스로 확인 가능하다.
+  2. **`time_keeper.pyw` 직접 실행** — 파이썬 + customtkinter가 있는 PC용. 오탐 위험이 없다.
+- 어느 쪽이든 `frozen`(exe) 여부를 감지해 자동 실행 등록이 올바른 대상을 가리키게 한다.
 - 저장은 JSON(설정·오늘 상태) + CSV(일별 기록). DB를 쓰지 않는다. SQLite도 쓰지
   않는다 — 파일을 메모장·엑셀로 열면 그냥 읽혀야 한다는 원칙 때문이다.
 
