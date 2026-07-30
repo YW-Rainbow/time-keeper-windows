@@ -848,6 +848,48 @@ class Overlay:
             self.win.destroy()
 
 
+# ── 일시정지 화면 ────────────────────────────────────────────────────────
+
+class PauseOverlay:
+    """일시정지 중 모든 모니터를 덮는다. 일시정지는 '컴퓨터에서 잠깐 떠난다'는 뜻이라,
+    덮지 않으면 시간만 안 깎인 채 계속 쓰는 구멍이 된다. 시간 종료 오버레이처럼
+    입력을 가로채지는 않는다(Alt+Tab으로 벗어날 수 있어도 괜찮다는 게 이 앱의 전제)."""
+
+    def __init__(self, app):
+        self.app = app
+        self.win = ctk.CTkToplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        x, y, w, h = virtual_screen()
+        if not w:
+            x, y, w, h = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.wm_geometry(f"{w}x{h}+{x}+{y}")   # CTk의 DPI 이중 스케일링 우회
+        self.win.configure(fg_color=C["bg"])
+        box = ctk.CTkFrame(self.win, fg_color="transparent")
+        relx, rely = overlay_content_pos((x, y, w, h), primary_screen())
+        box.place(relx=relx, rely=rely, anchor="center")
+        ctk.CTkLabel(box, text="잠깐 쉬는 중이에요", font=f(34, True),
+                     text_color=C["text"]).pack(pady=(0, 6))
+        self.sub = ctk.CTkLabel(box, text="", font=f(16), text_color=C["sub"])
+        self.sub.pack(pady=(0, 26))
+        ctk.CTkButton(box, text="다시 시작", font=f(16, True), height=48, width=300,
+                      corner_radius=12, command=self.app.resume).pack(pady=5)
+        self.refresh()
+
+    def refresh(self):
+        s = self.app.store
+        pid = s.state["current_user"]
+        if not pid or not s.profile(pid):
+            return
+        left = s.pause_resume_left(pid)
+        self.sub.configure(text=f"{s.profile(pid)['name']} · {left}분 뒤에 자동으로 다시 시작해요")
+        self.win.attributes("-topmost", True)
+
+    def destroy(self):
+        if self.win.winfo_exists():
+            self.win.destroy()
+
+
 # ── 마무리 안내 ('오늘은 여기까지' 후) ─────────────────────────────────────
 
 class WindDown:
@@ -1203,6 +1245,7 @@ class App:
         self.root.withdraw()   # 뿌리 창은 숨긴다. 보이는 것은 위젯·선택 창뿐
         self.banner = Banner(self)
         self.overlay = None
+        self.pause_overlay = None
         self.dashboard = None
         self.picker = None
         self.settings = None
@@ -1247,10 +1290,18 @@ class App:
                 self.winddown.refresh()
             return
         pid = s.state["current_user"]
-        if not pid or not s.profile(pid) or s.profile(pid)["no_limit"]:
+        if not pid or not s.profile(pid):
+            self.close_pause()
             self.close_overlay()
             return
+        # 일시정지는 '컴퓨터에서 잠깐 떠난다'는 뜻이라 화면을 덮는다(한도 유무와 무관).
         if s.user(pid)["paused"]:
+            self.close_overlay()
+            self.show_pause()
+            return
+        self.close_pause()
+        if s.profile(pid)["no_limit"]:
+            self.close_overlay()
             return
         rem = s.remaining(pid)
         if rem <= 0:
@@ -1275,6 +1326,7 @@ class App:
 
     def switch_user(self):
         self.close_winddown()
+        self.close_pause()
         self.store.select_user(None)
         self.close_overlay()
         self.refresh_all()
@@ -1327,14 +1379,29 @@ class App:
         pid = self.store.state["current_user"]
         if pid:
             self.store.set_paused(pid, True)
+            self.check_time()   # 일시정지 화면을 띄운다
             self.refresh_all()
 
     def resume(self):
         pid = self.store.state["current_user"]
         if pid:
             self.store.set_paused(pid, False)
+            self.close_pause()
             self.check_time()
             self.refresh_all()
+
+    def show_pause(self):
+        if self.pause_overlay is not None and self.pause_overlay.win.winfo_exists():
+            self.pause_overlay.refresh()
+            return
+        if self.root.grab_current() is not None:
+            return  # PIN 입력 중에는 만들지 않는다. 다음 틱(1분 안)에 다시 시도된다.
+        self.pause_overlay = PauseOverlay(self)
+
+    def close_pause(self):
+        if self.pause_overlay is not None:
+            self.pause_overlay.destroy()
+            self.pause_overlay = None
 
     def after_extension(self):
         pid = self.store.state["current_user"]
@@ -1387,6 +1454,8 @@ class App:
             self.widget.refresh()
         if self.overlay is not None and self.overlay.win.winfo_exists():
             self.overlay.refresh()
+        if self.pause_overlay is not None and self.pause_overlay.win.winfo_exists():
+            self.pause_overlay.refresh()
         if self.winddown is not None and self.winddown.win.winfo_exists():
             self.winddown.refresh()
         if self.dashboard is not None and self.dashboard.win.winfo_exists():
