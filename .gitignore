@@ -10,3 +10,8 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# PyInstaller 빌드 부산물 (exe는 저장소가 아니라 Releases로 배포한다)
+build/
+dist/
+*.spec
