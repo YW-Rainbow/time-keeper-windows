@@ -703,38 +703,48 @@ class RemainWidget:
         m.add_command(label="종료 (관리자)", command=self.app.quit_app)
         m.tk_popup(event.x_root, event.y_root)
 
-# ── 사용자 선택 창: PC를 켜면 가장 먼저 만나는 화면 ────────────────────────
+# ── 사용자 선택 화면: PC를 켜면 가장 먼저 만나는, 전체를 덮는 관문 ──────────
 
 class Picker:
+    """PC를 켜면 가장 먼저 만나는 전체 화면. 누가 쓰는지 고르기 전에는 넘어갈 수 없다.
+    시간 종료 오버레이와 같은 방식이라 입력을 가로채지는 않는다(Alt+Tab·작업관리자로
+    벗어날 수 있어도 괜찮다는 게 이 앱의 전제 — 전역 입력 후킹은 하지 않는다, CLAUDE.md)."""
+
     def __init__(self, app):
         self.app = app
         self.win = ctk.CTkToplevel(app.root)
-        frameless(self.win)
-        self.card = ctk.CTkFrame(self.win, corner_radius=20, fg_color=C["card"],
-                                 border_width=1, border_color=C["border"])
-        self.card.pack(padx=2, pady=2)
-        ctk.CTkLabel(self.card, text="누가 컴퓨터를 쓸까요?", font=f(22, True),
-                     text_color=C["text"]).pack(padx=48, pady=(30, 4))
-        ctk.CTkLabel(self.card, text="이름을 고르면 남은 시간이 화면에 표시돼요.\n고르지 않으면 시간이 기록되지 않아요.",
-                     font=f(13), text_color=C["sub"], justify="center").pack(padx=48, pady=(0, 14))
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", True)
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)  # Alt+F4로 건너뛰지 못하게
+        x, y, w, h = virtual_screen()
+        if not w:
+            x, y, w, h = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        self.win.wm_geometry(f"{w}x{h}+{x}+{y}")   # CTk의 DPI 이중 스케일링 우회
+        self.win.configure(fg_color=C["bg"])
+        box = ctk.CTkFrame(self.win, fg_color="transparent")
+        relx, rely = overlay_content_pos((x, y, w, h), primary_screen())
+        box.place(relx=relx, rely=rely, anchor="center")
+        ctk.CTkLabel(box, text="누가 컴퓨터를 쓸까요?", font=f(30, True),
+                     text_color=C["text"]).pack(pady=(0, 6))
+        ctk.CTkLabel(box, text="이름을 골라야 컴퓨터를 쓸 수 있어요. 고르면 남은 시간이 화면에 표시돼요.",
+                     font=f(14), text_color=C["sub"]).pack(pady=(0, 22))
         s = app.store
         for p in s.config["profiles"]:
             u = s.user(p["id"])
             info = f"오늘 {u['used_minutes']}분 사용" if u["used_minutes"] else "오늘 처음이에요"
-            ctk.CTkButton(self.card, text=f"{p['name']}   ·   {info}", font=f(15),
-                          height=46, width=320, anchor="w", corner_radius=12,
+            ctk.CTkButton(box, text=f"{p['name']}   ·   {info}", font=f(16),
+                          height=50, width=360, anchor="w", corner_radius=12,
                           fg_color="#273449", hover_color=C["accent"],
-                          command=lambda pid=p["id"]: self.choose(pid)).pack(padx=40, pady=5)
-        ctk.CTkButton(self.card, text="나중에 고를게요", font=f(12), width=140, height=30,
-                      fg_color="transparent", hover_color=C["border"], text_color=C["sub"],
-                      command=self.win.destroy).pack(pady=(12, 22))
-        center_window(self.win)
-        self.win.attributes("-topmost", True)
+                          command=lambda pid=p["id"]: self.choose(pid)).pack(pady=6)
+        # '나중에 고를게요' 같은 건너뛰기 버튼을 두지 않는다 — 고르기 전엔 넘어갈 수 없다.
+
+    def refresh(self):
+        self.win.attributes("-topmost", True)   # 다른 topmost 창에 밀리지 않게 유지
 
     def choose(self, pid):
         p = self.app.store.profile(pid)
-        if p is None:   # 이 창이 떠 있는 동안 설정에서 프로필이 지워진 경우
-            self.win.destroy()
+        if p is None:   # 이 화면이 떠 있는 동안 설정에서 프로필이 지워진 경우
+            self.app.close_picker()
             self.app.show_picker()
             return
         if p["pin_hash"]:
@@ -743,8 +753,11 @@ class Picker:
                          verify=lambda s: verify_pin(s, p["pin_hash"]))
             if ok is None:
                 return
-        self.win.destroy()
-        self.app.select_user(pid)
+        self.app.select_user(pid)   # select_user가 이 화면을 닫는다
+
+    def destroy(self):
+        if self.win.winfo_exists():
+            self.win.destroy()
 
 # ── 시간 종료 오버레이 ───────────────────────────────────────────────────
 
@@ -1266,8 +1279,9 @@ class App:
             if rolled:
                 self.warned.clear()
                 self.close_winddown()
+                self.close_pause()
                 self.close_overlay()
-                self.show_picker()
+                self.close_picker()   # 아래 check_time이 새 날짜 기준으로 다시 띄운다
             if event == "auto_resumed":
                 self.banner.show(f"일시정지 {self.store.config['pause_auto_resume_minutes']}분이 지나서 다시 시작했어요.")
             self.check_time()
@@ -1291,9 +1305,12 @@ class App:
             return
         pid = s.state["current_user"]
         if not pid or not s.profile(pid):
+            # 아직 아무도 안 골랐으면 전체 화면 선택 관문을 띄운다. 고르기 전엔 못 넘어간다.
             self.close_pause()
             self.close_overlay()
+            self.show_picker()
             return
+        self.close_picker()
         # 일시정지는 '컴퓨터에서 잠깐 떠난다'는 뜻이라 화면을 덮는다(한도 유무와 무관).
         if s.user(pid)["paused"]:
             self.close_overlay()
@@ -1413,10 +1430,16 @@ class App:
 
     def show_picker(self):
         if self.root.grab_current() is not None:
-            return  # PIN 카드 위를 topmost 창으로 덮으면 화면이 잠긴 것처럼 보인다
+            return  # PIN 입력 중에는 손대지 않는다(카드를 topmost로 덮지 않게)
         if self.picker is not None and self.picker.win.winfo_exists():
-            self.picker.win.destroy()   # lift 대신 재생성: '오늘 N분' 숫자를 새로 채운다
+            self.picker.refresh()   # 이미 떠 있으면 유지 (재생성하면 깜빡인다)
+            return
         self.picker = Picker(self)
+
+    def close_picker(self):
+        if self.picker is not None:
+            self.picker.destroy()
+            self.picker = None
 
     def show_overlay(self):
         if self.overlay is not None and self.overlay.win.winfo_exists():
@@ -1452,12 +1475,12 @@ class App:
             self.widget = RemainWidget(self)
         else:
             self.widget.refresh()
-        if self.overlay is not None and self.overlay.win.winfo_exists():
-            self.overlay.refresh()
-        if self.pause_overlay is not None and self.pause_overlay.win.winfo_exists():
-            self.pause_overlay.refresh()
-        if self.winddown is not None and self.winddown.win.winfo_exists():
-            self.winddown.refresh()
+        # PIN 입력 카드가 떠 있을 때(grab)는 전체 화면 덮개의 topmost를 다시 세우지 않는다.
+        # 안 그러면 덮개가 PIN 카드 위로 올라와 화면이 잠긴 것처럼 보인다.
+        if self.root.grab_current() is None:
+            for cover in (self.overlay, self.pause_overlay, self.picker, self.winddown):
+                if cover is not None and cover.win.winfo_exists():
+                    cover.refresh()
         if self.dashboard is not None and self.dashboard.win.winfo_exists():
             self.dashboard.refresh()
 
