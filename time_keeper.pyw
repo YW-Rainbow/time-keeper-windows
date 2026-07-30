@@ -62,7 +62,7 @@ DEFAULT_PROFILE = {
 }
 
 DEFAULT_CONFIG = {
-    "parent_pin_hash": None,
+    "admin_pin_hash": None,   # 설정 변경·연장·종료를 지키는 PIN. '관리하는 사람'용(꼭 부모가 아니어도 된다)
     "warn_at_minutes": [10, 5, 1],
     "extension_minutes": 5,
     "extension_cooldown_minutes": 30,    # '연속 금지'일 때 다음 5분까지 기다리는 시간
@@ -164,8 +164,8 @@ class Store:
         c = self.config
         for key, val in DEFAULT_CONFIG.items():   # 예전 설정 파일에 없는 키는 기본값으로 채움
             c.setdefault(key, json.loads(json.dumps(val)))
-        if not isinstance(c["parent_pin_hash"], str):
-            c["parent_pin_hash"] = None
+        if not isinstance(c["admin_pin_hash"], str):
+            c["admin_pin_hash"] = None
         c["extension_minutes"] = as_int(c["extension_minutes"], 5, lo=1)
         c["extension_cooldown_minutes"] = as_int(c["extension_cooldown_minutes"], 30)
         c["pause_auto_resume_minutes"] = as_int(c["pause_auto_resume_minutes"], 30, lo=1)
@@ -698,9 +698,9 @@ class RemainWidget:
             m.add_command(label="사용자 선택", command=self.app.show_picker)
         m.add_separator()
         m.add_command(label="기록 보기", command=self.app.show_dashboard)
-        m.add_command(label="설정 (부모)", command=self.app.show_settings)
-        # '종료' 항목은 일부러 없다. 끄고 싶으면 작업 관리자에서 끌 수 있고,
-        # 그걸 막지도 숨기지도 않는다. (README '끄는 방법' 참고)
+        m.add_command(label="설정 (관리자)", command=self.app.show_settings)
+        # 종료는 관리자 PIN으로 지킨다 — 관리자는 깔끔히 끄고, 아이는 눌러서 타이머를 피하지 못하게.
+        m.add_command(label="종료 (관리자)", command=self.app.quit_app)
         m.tk_popup(event.x_root, event.y_root)
 
 # ── 사용자 선택 창: PC를 켜면 가장 먼저 만나는 화면 ────────────────────────
@@ -779,7 +779,7 @@ class Overlay:
         self.note = ctk.CTkLabel(box, text="", font=f(12), text_color=C["sub"])
         self.note.pack(pady=(0, 8))
         self.pinrow = ctk.CTkFrame(box, fg_color="transparent")  # PIN 확인 후에만 나타나는 줄
-        self.btn_pin = ctk.CTkButton(box, text="부모 PIN으로 연장", font=f(14), height=40, width=300,
+        self.btn_pin = ctk.CTkButton(box, text="관리자 PIN으로 연장", font=f(14), height=40, width=300,
                                      corner_radius=12, fg_color="#273449", hover_color=C["accent"],
                                      command=self.parent_extend)
         self.btn_pin.pack(pady=5)
@@ -811,7 +811,7 @@ class Overlay:
             self.note.configure(text=f"다음 '5분만 더'는 {wait}분 뒤에 쓸 수 있어요. (오늘 {left}번 남음)")
         else:
             self.btn_more.configure(state="disabled")
-            self.note.configure(text="'5분만 더'는 오늘 다 썼어요. 부모 PIN으로는 연장할 수 있어요.")
+            self.note.configure(text="'5분만 더'는 오늘 다 썼어요. 관리자 PIN으로는 연장할 수 있어요.")
         self.win.attributes("-topmost", True)
 
     def more(self):
@@ -824,11 +824,11 @@ class Overlay:
 
     def parent_extend(self):
         s = self.app.store
-        if not s.config["parent_pin_hash"]:
-            self.note.configure(text="부모 PIN이 아직 없어요. 위젯 메뉴 → 설정에서 만들 수 있어요.")
+        if not s.config["admin_pin_hash"]:
+            self.note.configure(text="관리자 PIN이 아직 없어요. 위젯 메뉴 → 설정에서 만들 수 있어요.")
             return
-        ok = ask_pin(self.app.root, "부모 PIN", "연장할 시간을 고를 수 있어요.",
-                     verify=lambda x: verify_pin(x, s.config["parent_pin_hash"]))
+        ok = ask_pin(self.app.root, "관리자 PIN", "연장할 시간을 고를 수 있어요.",
+                     verify=lambda x: verify_pin(x, s.config["admin_pin_hash"]))
         if ok is None or not self.win.winfo_exists():   # 입력 중 자정이 지나 창이 닫힌 경우
             return
         for w in self.pinrow.winfo_children():
@@ -989,23 +989,23 @@ class Dashboard:
                 cv.create_text(cx, h - pb - bh - 10, text=f"{v}", fill=C["text"], font=(FONT, 10))
             cv.create_text(cx, h - pb + 14, text=label, fill=C["sub"], font=(FONT, 11))
 
-# ── 설정 (부모): 프로필·한도·PIN·자동 실행 ─────────────────────────────────
+# ── 설정 (관리자): 프로필·한도·PIN·자동 실행 ────────────────────────────────
 
 class Settings:
     def __init__(self, app):
         self.app = app
         s = app.store
-        if s.config["parent_pin_hash"]:
-            ok = ask_pin(app.root, "부모 PIN", "설정을 열려면 부모 PIN이 필요해요.",
-                         verify=lambda x: verify_pin(x, s.config["parent_pin_hash"]))
+        if s.config["admin_pin_hash"]:
+            ok = ask_pin(app.root, "관리자 PIN", "설정을 열려면 관리자 PIN이 필요해요.",
+                         verify=lambda x: verify_pin(x, s.config["admin_pin_hash"]))
             if ok is None:
                 return
         else:
-            pin = ask_pin(app.root, "부모 PIN 만들기",
-                          "설정을 보호할 부모 PIN을 먼저 만들어 주세요.", confirm_new=True)
+            pin = ask_pin(app.root, "관리자 PIN 만들기",
+                          "설정을 지킬 관리자 PIN을 먼저 만들어 주세요.", confirm_new=True)
             if pin is None:
                 return
-            s.config["parent_pin_hash"] = hash_pin(pin)
+            s.config["admin_pin_hash"] = hash_pin(pin)
             s.save_config()
         self.build()
 
@@ -1034,9 +1034,9 @@ class Settings:
         ctk.CTkButton(foot, text="+ 프로필 추가", font=f(13), width=110,
                       fg_color="#273449", hover_color=C["accent"],
                       command=self.add_profile).pack(side="left")
-        ctk.CTkButton(foot, text="부모 PIN 변경", font=f(13), width=110,
+        ctk.CTkButton(foot, text="관리자 PIN 변경", font=f(13), width=110,
                       fg_color="#273449", hover_color=C["accent"],
-                      command=self.change_parent_pin).pack(side="left", padx=8)
+                      command=self.change_admin_pin).pack(side="left", padx=8)
         self.auto_btn = ctk.CTkButton(foot, text=self.auto_label(), font=f(13), width=170,
                                       fg_color="#273449", hover_color=C["accent"],
                                       command=self.toggle_autostart)
@@ -1105,12 +1105,12 @@ class Settings:
             if btn.winfo_exists():   # PIN 입력 중 설정 창이 닫혔을 수 있다
                 btn.configure(text="변경·삭제")
 
-    def change_parent_pin(self):
+    def change_admin_pin(self):
         s = self.app.store
-        pin = ask_pin(self.app.root, "새 부모 PIN", "새로 사용할 부모 PIN을 입력해 주세요.",
+        pin = ask_pin(self.app.root, "새 관리자 PIN", "새로 사용할 관리자 PIN을 입력해 주세요.",
                       confirm_new=True)
         if pin is not None:
-            s.config["parent_pin_hash"] = hash_pin(pin)
+            s.config["admin_pin_hash"] = hash_pin(pin)
             s.save_config()
 
     def auto_label(self):
@@ -1294,6 +1294,22 @@ class App:
     def shutdown_now(self):
         self.close_winddown()
         shutdown_pc()
+
+    # -- 종료 (관리자 PIN으로 보호) -----------------------------------------
+
+    def quit_app(self):
+        s = self.store
+        if s.config["admin_pin_hash"]:
+            ok = ask_pin(self.root, "관리자 PIN", "프로그램을 끝내려면 관리자 PIN이 필요해요.",
+                         verify=lambda x: verify_pin(x, s.config["admin_pin_hash"]))
+            if ok is None:
+                return
+        elif not messagebox.askyesno(APP_ID, "관리자 PIN이 아직 없어요. 그래도 끝낼까요?\n"
+                                     "(설정에서 관리자 PIN을 만들면 다음부터 PIN으로 보호돼요.)"):
+            return
+        # 사용 시간은 매 틱마다 이미 저장돼 있다. 그대로 창을 닫으면 mainloop이 끝나고
+        # 프로세스가 종료되며 단일 실행 뮤텍스도 풀린다.
+        self.root.destroy()
 
     def close_winddown(self):
         self.winddown_until = None
