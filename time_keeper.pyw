@@ -333,7 +333,10 @@ class Store:
         p, u = self.profile(pid), self.user(pid)
         if p and any([u["used_minutes"], u["pause_minutes"],
                       u["extensions_self"], u["extensions_parent"]]):
-            day = date.today()
+            try:  # 상태가 대표하는 날짜로 기록한다(실제 시계 날짜가 아니라)
+                day = date.fromisoformat(self.state["date"])
+            except (TypeError, ValueError):
+                day = date.today()
             limit = "" if p["no_limit"] else self.limit_on(p, day)
             self._append_csv([day.isoformat(), p["name"], u["used_minutes"], limit,
                               u["extensions_self"], u["extensions_parent"], u["pause_minutes"]])
@@ -354,11 +357,14 @@ class Store:
                     u["paused"], u["pause_started"] = False, None
                     event = "auto_resumed"   # 켜두고 잊는 걸 막는 용도. 기록은 남는다
             else:
-                u["used_minutes"] += 1
-                rem = self.remaining(pid, now)
-                if rem is not None and rem <= 0 and u["extension_ended"] is None:
-                    # 주어진 시간이 다 떨어진 시각. '연속 금지' 재사용 대기의 기준점.
-                    u["extension_ended"] = now.isoformat(timespec="seconds")
+                rem = self.remaining(pid, now)   # 이번 1분을 세기 전의 남은 시간
+                if rem is None or rem > 0:
+                    u["used_minutes"] += 1
+                    # 이번 증가로 한도에 도달했으면 그 시각을 남긴다('연속 금지' 재사용 대기의 기준점).
+                    if rem is not None and self.remaining(pid, now) <= 0 and u["extension_ended"] is None:
+                        u["extension_ended"] = now.isoformat(timespec="seconds")
+                # rem<=0이면 세지 않는다. 한도가 끝난 뒤 오버레이 앞에서 시간이 흘러도
+                # 남은 시간이 새지 않게 — 2분 기다렸다 '5분만 더'를 눌러도 온전히 5분이 되도록.
         self.save_state()
         return event
 
@@ -471,6 +477,25 @@ def virtual_screen():
         gsm = ctypes.windll.user32.GetSystemMetrics
         return gsm(76), gsm(77), gsm(78), gsm(79)
     return 0, 0, None, None
+
+
+def primary_screen():
+    """주 모니터 크기 (w, h). 주 모니터는 항상 (0,0)에서 시작한다."""
+    if IS_WINDOWS:
+        gsm = ctypes.windll.user32.GetSystemMetrics
+        return gsm(0), gsm(1)  # SM_CXSCREEN, SM_CYSCREEN
+    return None, None
+
+
+def overlay_content_pos(virtual, primary):
+    """오버레이 창(가상 화면 전체) 안에서 내용 상자를 놓을 상대 위치 (relx, rely).
+    듀얼 모니터에서 두 화면 경계에 버튼이 걸리지 않도록 주 모니터 중앙을 가리킨다.
+    상대 좌표라 DPI 배율의 영향을 받지 않는다(창 크기에 대한 비율)."""
+    vx, vy, vw, vh = virtual
+    pw, ph = primary
+    if not (pw and vw):
+        return 0.5, 0.5
+    return (pw / 2 - vx) / vw, (ph / 2 - vy) / vh
 
 
 def f(size, bold=False):
@@ -699,7 +724,9 @@ class Overlay:
         self.win.wm_geometry(f"{w}x{h}+{x}+{y}")
         self.win.configure(fg_color=C["bg"])
         box = ctk.CTkFrame(self.win, fg_color="transparent")
-        box.place(relx=0.5, rely=0.5, anchor="center")
+        # 듀얼 모니터에서 버튼이 두 화면 경계에 걸리지 않게 주 모니터 중앙에 놓는다.
+        relx, rely = overlay_content_pos((x, y, w, h), primary_screen())
+        box.place(relx=relx, rely=rely, anchor="center")
         self.title = ctk.CTkLabel(box, text="오늘 사용 시간이 끝났어요", font=f(34, True),
                                   text_color=C["text"])
         self.title.pack(pady=(0, 6))
