@@ -85,6 +85,7 @@ DEFAULT_USER_STATE = {
     "pause_started": None,     # ISO 시각
     "last_self_extension": None,  # ISO 시각 — '연속 금지' 판정용
     "extension_ended": None,   # 주어진 시간이 실제로 다 떨어진 시각 — 재사용 대기의 기준점
+    "winddown_until": None,    # '오늘은 여기까지' 후 절전 예정 시각 — 사람별 하루 한 번(7절)
 }
 
 CSV_HEADER = ["date", "user", "used_minutes", "limit_minutes",
@@ -224,7 +225,7 @@ class Store:
                 except (TypeError, ValueError):
                     base[key] = 0
             base["paused"] = bool(base["paused"])
-            for key in ("pause_started", "last_self_extension", "extension_ended"):
+            for key in ("pause_started", "last_self_extension", "extension_ended", "winddown_until"):
                 if not isinstance(base[key], str):
                     base[key] = None
             clean[pid] = base
@@ -287,7 +288,28 @@ class Store:
                 pass
         return True, None, 0
 
+    def winddown_until(self, pid):
+        try:
+            return datetime.fromisoformat(self.user(pid)["winddown_until"])
+        except (TypeError, ValueError):
+            return None
+
+    def winddown_used(self, pid, now=None):
+        """오늘 마무리 시간을 이미 다 썼는가(절전 예정 시각이 지났는가)."""
+        until = self.winddown_until(pid)
+        return until is not None and (now or datetime.now()) >= until
+
     # -- 변경 ------------------------------------------------------------
+
+    def start_winddown(self, pid, now=None):
+        # 사람별 하루 한 번. 이미 정해졌으면 처음 시각을 그대로 둔다 — 사용자 바꾸기나
+        # 절전→깨우기로 돌아와 다시 누를 때마다 새 5분이 생기던 구멍을 막는다(7절).
+        u = self.user(pid)
+        if u["winddown_until"] is None:
+            until = (now or datetime.now()) + timedelta(minutes=self.config["winddown_sleep_minutes"])
+            u["winddown_until"] = until.isoformat(timespec="seconds")
+            self.save_state()
+        return self.winddown_until(pid)
 
     def rollover(self, now=None):
         """날짜가 바뀌었으면 전날 기록을 CSV로 남기고 카운터를 리셋한다."""
@@ -770,6 +792,9 @@ class Overlay:
         self.win = ctk.CTkToplevel(app.root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
+        # Alt+F4로 닫으면 다음 틱(최대 1분)까지 화면이 열리고, 한도가 끝난 뒤라 그 시간은
+        # 기록에도 안 남는다. 1분마다 반복하면 계속 쓰는 구멍이 되어 선택 화면처럼 막는다.
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
         x, y, w, h = virtual_screen()
         if not w:  # 윈도우가 아니면 주 화면 크기로 (-fullscreen은 창 관리자에 의존해서 안 쓴다)
             x, y, w, h = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
@@ -805,6 +830,8 @@ class Overlay:
                                       border_color=C["border"], hover_color=C["border"],
                                       command=self.app.start_winddown)
         self.btn_done.pack(pady=5)
+        self.done_note = ctk.CTkLabel(box, text="", font=f(12), text_color=C["sub"])
+        self.done_note.pack()
         self.refresh()
 
     def refresh(self):
@@ -825,6 +852,14 @@ class Overlay:
         else:
             self.btn_more.configure(state="disabled")
             self.note.configure(text="'5분만 더'는 오늘 다 썼어요. 관리자 PIN으로는 연장할 수 있어요.")
+        # 마무리 시간을 이미 썼으면 누르는 즉시 절전된다. 버튼 이름으로 미리 알려서
+        # 모르고 눌렀다가 갑자기 꺼지는 일이 없게 한다.
+        if s.winddown_used(pid):
+            self.btn_done.configure(text="지금 절전하기")
+            self.done_note.configure(text="오늘 마무리 시간은 이미 썼어요.")
+        else:
+            self.btn_done.configure(text="오늘은 여기까지")
+            self.done_note.configure(text="")
         self.win.attributes("-topmost", True)
 
     def more(self):
@@ -873,6 +908,8 @@ class PauseOverlay:
         self.win = ctk.CTkToplevel(app.root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
+        # 일시정지 중엔 시간이 안 깎인다. Alt+F4로 덮개를 닫고 쓰는 구멍을 막는다(종료 화면과 같은 이유).
+        self.win.protocol("WM_DELETE_WINDOW", lambda: None)
         x, y, w, h = virtual_screen()
         if not w:
             x, y, w, h = 0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()
@@ -1262,8 +1299,7 @@ class App:
         self.dashboard = None
         self.picker = None
         self.settings = None
-        self.winddown = None
-        self.winddown_until = None   # '오늘은 여기까지' 후 절전까지 남은 시각
+        self.winddown = None   # 마무리 안내 창. 절전 예정 시각은 사람별로 state에 있다
         self.warned = {}       # {pid: 지나간 경고 시점들} — 같은 시점 중복 알림 금지
         self.widget = RemainWidget(self)
         self.show_picker()     # 시작할 때는 항상 묻는다. 이전 사용자를 가정하지 않는다.
@@ -1292,25 +1328,30 @@ class App:
 
     def check_time(self):
         s = self.store
-        # '오늘은 여기까지' 마무리 중이면 그 흐름을 우선한다.
-        if self.winddown_until is not None:
-            if datetime.now() >= self.winddown_until:
-                self.close_winddown()
-                sleep_pc()   # 정해둔 시간이 지나면 절전. 아이가 고른 마무리의 일부다(강제 아님).
-            else:
-                self.close_overlay()   # 마무리 중에는 화면을 열어 둔다(저장·정리)
-                if self.winddown is None or not self.winddown.win.winfo_exists():
-                    self.winddown = WindDown(self)   # 닫혔으면 되살린다
-                self.winddown.refresh()
-            return
         pid = s.state["current_user"]
         if not pid or not s.profile(pid):
             # 아직 아무도 안 골랐으면 전체 화면 선택 관문을 띄운다. 고르기 전엔 못 넘어간다.
+            self.close_winddown()
             self.close_pause()
             self.close_overlay()
             self.show_picker()
             return
         self.close_picker()
+        # '오늘은 여기까지' 마무리 중이면 그 흐름을 우선한다. 예정 시각은 사람별로 state.json에
+        # 있어서, 사용자를 바꿨다 돌아오거나 앱을 다시 켜도 처음 정한 시각 그대로 이어진다.
+        until = s.winddown_until(pid)
+        if until is not None and datetime.now() < until:
+            self.close_overlay()   # 마무리 중에는 화면을 열어 둔다(저장·정리)
+            if self.winddown is None or not self.winddown.win.winfo_exists():
+                self.winddown = WindDown(self)   # 닫혔으면 되살린다
+            self.winddown.refresh()
+            return
+        if self.winddown is not None:
+            # 지켜보던 마무리가 방금 끝났다. 절전은 아이가 고른 마무리의 일부다(강제 아님).
+            # 깨우면 아래로 내려가 종료 화면이 다시 뜨고, 그때 버튼은 '지금 절전하기'가 된다.
+            self.close_winddown()
+            sleep_pc()
+            return
         # 일시정지는 '컴퓨터에서 잠깐 떠난다'는 뜻이라 화면을 덮는다(한도 유무와 무관).
         if s.user(pid)["paused"]:
             self.close_overlay()
@@ -1352,18 +1393,23 @@ class App:
     # -- '오늘은 여기까지' 마무리 --------------------------------------------
 
     def start_winddown(self):
-        mins = self.store.config["winddown_sleep_minutes"]
-        self.winddown_until = datetime.now() + timedelta(minutes=mins)
-        self.close_overlay()   # 화면을 열어 준다 — 저장·정리하고 직접 끌 수 있게
-        if self.winddown is None or not self.winddown.win.winfo_exists():
-            self.winddown = WindDown(self)
-        else:
-            self.winddown.refresh()
+        pid = self.store.state["current_user"]
+        if not pid:
+            return
+        if self.store.winddown_used(pid):
+            # 오늘 마무리 시간은 이미 썼다. 버튼이 '지금 절전하기'로 바뀌어 있으니 아이가 알고 고른 것.
+            # 종료 화면은 그대로 둔다 — 깨우면 같은 화면으로 돌아온다.
+            sleep_pc()
+            return
+        self.store.start_winddown(pid)
+        self.check_time()   # 화면을 열어 준다 — 저장·정리하고 직접 끌 수 있게
 
     def winddown_left(self):
-        if not self.winddown_until:
+        pid = self.store.state["current_user"]
+        until = self.store.winddown_until(pid) if pid else None
+        if until is None:
             return 0
-        secs = (self.winddown_until - datetime.now()).total_seconds()
+        secs = (until - datetime.now()).total_seconds()
         return max(0, int((secs + 59) // 60))   # 분 단위 올림
 
     def shutdown_now(self):
@@ -1387,7 +1433,8 @@ class App:
         self.root.destroy()
 
     def close_winddown(self):
-        self.winddown_until = None
+        # 안내 창만 닫는다. 절전 예정 시각(state)은 지우지 않는다 — 지우면 사용자 바꾸기로
+        # 다녀올 때마다 새 5분이 생긴다.
         if self.winddown is not None:
             self.winddown.destroy()
             self.winddown = None
@@ -1411,8 +1458,7 @@ class App:
         if self.pause_overlay is not None and self.pause_overlay.win.winfo_exists():
             self.pause_overlay.refresh()
             return
-        if self.root.grab_current() is not None:
-            return  # PIN 입력 중에는 만들지 않는다. 다음 틱(1분 안)에 다시 시도된다.
+        self.cancel_pin_entry()
         self.pause_overlay = PauseOverlay(self)
 
     def close_pause(self):
@@ -1429,11 +1475,13 @@ class App:
     # -- 창 관리 ------------------------------------------------------------
 
     def show_picker(self):
-        if self.root.grab_current() is not None:
-            return  # PIN 입력 중에는 손대지 않는다(카드를 topmost로 덮지 않게)
         if self.picker is not None and self.picker.win.winfo_exists():
-            self.picker.refresh()   # 이미 떠 있으면 유지 (재생성하면 깜빡인다)
+            # 이미 떠 있으면 유지 (재생성하면 깜빡인다). 선택 화면의 개인 PIN 카드가
+            # 열려 있을 때는 topmost를 다시 세우지 않는다 — 카드를 덮어버리지 않게.
+            if self.root.grab_current() is None:
+                self.picker.refresh()
             return
+        self.cancel_pin_entry()
         self.picker = Picker(self)
 
     def close_picker(self):
@@ -1445,9 +1493,17 @@ class App:
         if self.overlay is not None and self.overlay.win.winfo_exists():
             self.overlay.refresh()
             return
-        if self.root.grab_current() is not None:
-            return  # PIN 입력 중에는 만들지 않는다. 다음 틱(1분 안)에 다시 시도된다.
+        self.cancel_pin_entry()
         self.overlay = Overlay(self)
+
+    def cancel_pin_entry(self):
+        # 덮개를 새로 띄워야 하는데 PIN 입력 카드가 열려 있으면 그 입력을 취소한다.
+        # 예전엔 '다음 틱에 다시 시도'했지만, 위젯 메뉴의 관리자 PIN 카드를 열어둔 채 두면
+        # 덮개가 영영 안 떠서 시간이 끝나도 계속 쓰는 구멍이 됐다. 취소된 ask_pin은
+        # None을 돌려주고, 부른 쪽은 모두 조용히 물러난다.
+        grab = self.root.grab_current()
+        if grab is not None:
+            grab.destroy()
 
     def close_overlay(self):
         if self.overlay is not None:
