@@ -1552,6 +1552,18 @@ def already_running():
     return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
 
 
+def shut_down_last():
+    # PC를 끌 때 윈도우는 앱들에 차례로 '꺼도 되나?'를 묻고, 된다고 한 앱은 곧바로 끝낸다.
+    # 기본 순서면 이 앱이 일찍 꺼진 뒤 PPT 같은 앱의 '저장할까요?'에서 종료가 취소돼,
+    # 키퍼 없이 PC만 켜진 채로 남았다. 종료 순서를 맨 뒤(0x100)로 미뤄, 다른 앱이 다 닫힌
+    # 뒤에야 끝나게 한다. 종료를 막거나 되살리는 게 아니다(작업관리자로는 그대로 끝낼 수 있다).
+    if IS_WINDOWS:
+        try:
+            ctypes.windll.kernel32.SetProcessShutdownParameters(0x100, 0)
+        except (OSError, AttributeError):
+            pass
+
+
 def main():
     if ctk is None:
         root = tk.Tk()
@@ -1572,6 +1584,7 @@ def main():
                             "작업 관리자(Ctrl+Shift+Esc)의 '자세히' 탭에서 pythonw.exe를 끝낸 뒤\n"
                             "다시 실행해 주세요.")
         return
+    shut_down_last()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     app = App(Store())
