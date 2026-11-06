@@ -14,6 +14,7 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from datetime import date, datetime, timedelta
 from tkinter import messagebox
@@ -91,6 +92,18 @@ DEFAULT_USER_STATE = {
 CSV_HEADER = ["date", "user", "used_minutes", "limit_minutes",
               "extensions_self", "extensions_parent", "pause_minutes"]
 
+UNCLEAN_KEEP = 30   # '정상적으로 꺼지지 않은 때' 기록은 최근 이만큼만 state.json에 둔다
+SESSION_END_GRACE = timedelta(minutes=2)   # 윈도우 종료 알림 뒤 '실행 중' 표시를 다시 세우지 않는 시간
+
+
+def fmt_when(iso):
+    """'2026-11-04T21:25:11' → '11월 4일(수) 21:25'. 읽을 수 없으면 빈 문자열."""
+    try:
+        t = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return ""
+    return f"{t.month}월 {t.day}일({WEEKDAYS[t.weekday()]}) {t:%H:%M}"
+
 # ── 저장: 원자적 JSON 쓰기, PIN 해시 ────────────────────────────────────
 
 def load_json(path, default):
@@ -144,6 +157,10 @@ class Store:
         self._sanitize_config()
         self.state = load_json(self.state_path, {"date": "", "current_user": None, "users": {}})
         self._sanitize_state()
+        self._session_end_at = None
+        # 지난 실행이 '정상 종료' 표시 없이 끝났는지 먼저 본다(current_user를 비우기 전에 —
+        # 그때 누가 쓰고 있었는지가 기록에 필요하다).
+        self.last_unclean = self._note_unclean_exit(now)
         self.rollover(now)
         # 앱이 꺼져 있는 동안 일시정지 자동 재개 시간이 지났으면 정리해 둔다
         for u in self.state["users"].values():
@@ -152,6 +169,7 @@ class Store:
         # 앱을 켤 때는 항상 '누가 쓸까요?'부터 다시 묻는다. 이전 사용자를 가정하면
         # 다른 가족의 시간이 남의 이름으로 기록될 수 있다. (그날의 카운터는 유지된다)
         self.state["current_user"] = None
+        self.heartbeat(now)
         self.save_state()
 
     # 손으로 고친 파일도 조용히 수습한다(SPEC 3절). 잘못된 값 하나 때문에
@@ -232,6 +250,42 @@ class Store:
         s["users"] = clean
         if not isinstance(s.get("current_user"), str):
             s["current_user"] = None
+        if not isinstance(s.get("alive"), dict):
+            s["alive"] = None
+        exits = s.get("unclean_exits") if isinstance(s.get("unclean_exits"), list) else []
+        s["unclean_exits"] = [e for e in exits if isinstance(e, dict)][-UNCLEAN_KEEP:]
+
+    # -- '정상적으로 꺼지지 않은 때' 기록 (SPEC 10절) ------------------------
+    # 막는 장치가 아니라 보이게 하는 장치다. 작업관리자로 끝내거나 멈춘 창을 닫아도
+    # 막지 않고 되살리지도 않는다(CLAUDE.md). 다음에 켜질 때 그 사실을 남겨 보여줄 뿐이다.
+    # 방식: 실행 중에는 state.json의 alive에 1분마다 '살아 있음'을 적고, 관리자 종료나
+    # 윈도우 종료·로그오프 때 지운다. 다음 실행에서 alive가 남아 있으면 정상 종료가 아니었던 것.
+
+    def heartbeat(self, now=None):
+        now = now or datetime.now()
+        if self._session_end_at is not None and now - self._session_end_at < SESSION_END_GRACE:
+            return   # 꺼지는 중이다. 여기서 다시 세우면 정상 종료가 비정상으로 기록된다.
+        # 종료가 취소되고 2분이 지나면(다른 앱의 '저장할까요?'에서 취소 등) 다시 세운다.
+        self._session_end_at = None
+        self.state["alive"] = {"last_seen": now.isoformat(timespec="seconds"),
+                               "user": self.state["current_user"]}
+
+    def mark_clean_exit(self, now=None):
+        self._session_end_at = now or datetime.now()
+        self.state["alive"] = None
+        self.save_state()
+
+    def _note_unclean_exit(self, now):
+        alive = self.state["alive"]
+        self.state["alive"] = None
+        if not alive:
+            return None
+        p = self.profile(alive.get("user"))
+        last_seen = alive.get("last_seen") if isinstance(alive.get("last_seen"), str) else None
+        entry = {"last_seen": last_seen, "user": p["name"] if p else None,
+                 "restarted": now.isoformat(timespec="seconds")}
+        self.state["unclean_exits"] = (self.state["unclean_exits"] + [entry])[-UNCLEAN_KEEP:]
+        return entry
 
     # -- 조회 ------------------------------------------------------------
 
@@ -394,6 +448,7 @@ class Store:
                         u["extension_ended"] = now.isoformat(timespec="seconds")
                 # rem<=0이면 세지 않는다. 한도가 끝난 뒤 오버레이 앞에서 시간이 흘러도
                 # 남은 시간이 새지 않게 — 2분 기다렸다 '5분만 더'를 눌러도 온전히 5분이 되도록.
+        self.heartbeat(now)
         self.save_state()
         return event
 
@@ -403,6 +458,7 @@ class Store:
             pu = self.user(prev)
             pu["paused"], pu["pause_started"] = False, None  # 떠난 사람의 일시정지는 의미가 없다
         self.state["current_user"] = pid
+        self.heartbeat(now)   # '그때 누가 쓰고 있었는지'를 다음 틱까지 기다리지 않고 맞춘다
         self.save_state()
 
     def set_paused(self, pid, paused, now=None):
@@ -516,23 +572,35 @@ def primary_screen():
     return None, None
 
 
+def in_background(fn):
+    # 전원 명령은 화면 스레드에서 부르지 않는다. SetSuspendState는 절전에서 깨어난 뒤에도
+    # 한참 돌아오지 않을 수 있는데, 그동안 화면 스레드가 멈춰 '응답 없음'이 되고, 멈춘 창은
+    # 윈도우의 '프로그램 닫기' 한 번으로 PIN 없이 꺼진다. 실제로 '절전 → 9초 뒤 깨움 →
+    # 키퍼가 응답 없음으로 닫힘'이 반복되며 키퍼 없이 계속 쓰게 됐다(2026-11 이벤트 로그 확인).
+    threading.Thread(target=fn, daemon=True).start()
+
+
 def sleep_pc():
     # 절전(대기 모드). 되돌릴 수 있는 부드러운 방식이라 최대절전·종료 대신 이걸 쓴다.
     # 시간이 됐다고 앱이 멋대로 부르지 않는다 — 아이가 '오늘은 여기까지'를 고른 뒤에만.
     if IS_WINDOWS:
-        try:
-            ctypes.windll.powrprof.SetSuspendState(0, 1, 0)  # bHibernate=0 → 절전
-        except OSError:
-            pass
+        def go():
+            try:
+                ctypes.windll.powrprof.SetSuspendState(0, 1, 0)  # bHibernate=0 → 절전
+            except OSError:
+                pass
+        in_background(go)
 
 
 def shutdown_pc():
     # 정상 종료. 아이가 '지금 컴퓨터 끄기'를 직접 누른 경우에만 부른다(강제 아님).
     if IS_WINDOWS:
-        try:
-            subprocess.run(["shutdown", "/s", "/t", "0"], creationflags=0x08000000)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        def go():
+            try:
+                subprocess.run(["shutdown", "/s", "/t", "0"], creationflags=0x08000000)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        in_background(go)
 
 
 def overlay_content_pos(virtual, primary):
@@ -981,7 +1049,7 @@ class Dashboard:
         self.app = app
         self.win = ctk.CTkToplevel(app.root)   # 이 창은 보통 창이라 닫아도 된다
         self.win.title("기록 보기 — time-keeper-windows")
-        self.win.geometry("820x700")
+        self.win.geometry("820x800")
         self.win.configure(fg_color=C["bg"])
         self.win.attributes("-topmost", True)
         ctk.CTkLabel(self.win, text="오늘", font=f(17, True), text_color=C["text"]
@@ -998,10 +1066,19 @@ class Dashboard:
                                             command=lambda _=None: self.draw_chart())
         self.range.set("이번 주")
         self.range.pack(side="left", padx=10)
-        self.canvas = tk.Canvas(self.win, bg=C["bg"], highlightthickness=0, height=330)
-        self.canvas.pack(fill="both", expand=True, padx=20, pady=(4, 10))
+        # 아래쪽 칸들을 먼저 바닥에 붙여 둔다. 차트가 남은 공간을 다 가져가도 잘리지 않게.
+        # (side="bottom"은 먼저 넣은 것이 가장 아래에 놓인다)
         ctk.CTkLabel(self.win, text=f"원본 기록: {app.store.log_path}  (엑셀로 열 수 있어요)",
-                     font=f(11), text_color=C["sub"]).pack(anchor="w", padx=24, pady=(0, 12))
+                     font=f(11), text_color=C["sub"]).pack(side="bottom", anchor="w", padx=24, pady=(0, 12))
+        self.unclean_box = ctk.CTkFrame(self.win, corner_radius=14, fg_color=C["card"])
+        self.unclean_box.pack(side="bottom", fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(self.win, text="작업 관리자로 끝내거나, 멈춘 창을 닫거나, 전원이 갑자기 꺼지면 남아요. "
+                                    "그 뒤로 다시 켜질 때까지는 사용 시간이 기록되지 않아요.",
+                     font=f(11), text_color=C["sub"]).pack(side="bottom", anchor="w", padx=24, pady=(0, 4))
+        ctk.CTkLabel(self.win, text="타임키퍼가 정상적으로 꺼지지 않은 때", font=f(15, True),
+                     text_color=C["text"]).pack(side="bottom", anchor="w", padx=24, pady=(4, 0))
+        self.canvas = tk.Canvas(self.win, bg=C["bg"], highlightthickness=0, height=260)
+        self.canvas.pack(fill="both", expand=True, padx=20, pady=(4, 10))
         self.refresh()
         self.win.bind("<Configure>", lambda e: self.draw_chart() if e.widget is self.win else None)
 
@@ -1034,7 +1111,32 @@ class Dashboard:
                 txt = f"{u['used_minutes']} / {limit}분"
             ctk.CTkLabel(r, text=txt, font=f(12), width=110, anchor="e",
                          text_color=C["sub"]).pack(side="right")
+        self.draw_unclean()
         self.draw_chart()
+
+    def draw_unclean(self):
+        for w in self.unclean_box.winfo_children():
+            w.destroy()
+        exits = self.app.store.state["unclean_exits"][-5:][::-1]   # 최근 5건, 새것부터
+        if not exits:
+            ctk.CTkLabel(self.unclean_box, text="아직 없어요.", font=f(12),
+                         text_color=C["sub"]).pack(anchor="w", padx=16, pady=10)
+            return
+        for e in exits:
+            seen = fmt_when(e.get("last_seen")) or "알 수 없음"
+            who = f"{e['user']} 사용 중" if e.get("user") else "선택한 사람 없음"
+            back = fmt_when(e.get("restarted"))
+            try:   # 같은 날 다시 켜졌으면 시각만
+                t_seen, t_back = (datetime.fromisoformat(e["last_seen"]),
+                                  datetime.fromisoformat(e["restarted"]))
+                if t_seen.date() == t_back.date():
+                    back = f"{t_back:%H:%M}"
+            except (KeyError, TypeError, ValueError):
+                pass
+            ctk.CTkLabel(self.unclean_box,
+                         text=f"{seen}쯤 · {who}" + (f"   →   다시 켜짐 {back}" if back else ""),
+                         font=f(12), text_color=C["text"]).pack(anchor="w", padx=16, pady=3)
+        ctk.CTkFrame(self.unclean_box, height=4, fg_color="transparent").pack()
 
     def draw_chart(self):
         s = self.app.store
@@ -1302,8 +1404,17 @@ class App:
         self.winddown = None   # 마무리 안내 창. 절전 예정 시각은 사람별로 state에 있다
         self.warned = {}       # {pid: 지나간 경고 시점들} — 같은 시점 중복 알림 금지
         self.widget = RemainWidget(self)
+        # 윈도우가 종료·로그오프를 알리면(WM_QUERYENDSESSION) Tk가 숨긴 뿌리 창에 이 신호를 준다.
+        # 여기서 '정상 종료'로 표시해 둔다. 막거나 미루지 않는다 — 표시만 하고 바로 돌아온다.
+        self.root.protocol("WM_SAVE_YOURSELF", self.store.mark_clean_exit)
         self.show_picker()     # 시작할 때는 항상 묻는다. 이전 사용자를 가정하지 않는다.
         self.check_time()
+        if store.last_unclean:
+            # 누구 탓인지 따지는 문구가 아니다. 전원이 갑자기 나가도 같은 기록이 남는다.
+            when = fmt_when(store.last_unclean["last_seen"])
+            self.banner.show("지난번에는 타임키퍼가 정상적으로 꺼지지 않았어요"
+                             + (f" (마지막 확인 {when})" if when else "")
+                             + ". 기록 보기에 남겨 뒀어요.", ms=15000)
         self.root.after(60_000, self.tick)
 
     # -- 시간 흐름 ---------------------------------------------------------
@@ -1348,10 +1459,11 @@ class App:
             return
         if self.winddown is not None:
             # 지켜보던 마무리가 방금 끝났다. 절전은 아이가 고른 마무리의 일부다(강제 아님).
-            # 깨우면 아래로 내려가 종료 화면이 다시 뜨고, 그때 버튼은 '지금 절전하기'가 된다.
+            # 절전은 백그라운드에서 걸리므로, return하지 않고 아래로 내려가 종료 화면을 미리 띄운다.
+            # 그래야 깨웠을 때 다음 틱(최대 1분)을 기다리지 않고 곧바로 종료 화면이 보인다.
+            # 이때 버튼은 '지금 절전하기'가 된다.
             self.close_winddown()
             sleep_pc()
-            return
         # 일시정지는 '컴퓨터에서 잠깐 떠난다'는 뜻이라 화면을 덮는다(한도 유무와 무관).
         if s.user(pid)["paused"]:
             self.close_overlay()
@@ -1430,6 +1542,7 @@ class App:
             return
         # 사용 시간은 매 틱마다 이미 저장돼 있다. 그대로 창을 닫으면 mainloop이 끝나고
         # 프로세스가 종료되며 단일 실행 뮤텍스도 풀린다.
+        s.mark_clean_exit()   # 관리자가 끈 것은 '정상적으로 꺼지지 않은 때'에 남기지 않는다
         self.root.destroy()
 
     def close_winddown(self):
