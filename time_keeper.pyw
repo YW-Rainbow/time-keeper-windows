@@ -2,8 +2,9 @@
 #
 # 가족이 함께 쓰는 윈도우 PC에서 각자의 화면 사용 시간을 '보이게' 하는 도구.
 # 이 앱은 잠금 화면이 아니다. 감시·차단 없이 남은 시간을 항상 보여주는 것이
-# 핵심이므로, 우회를 막는 코드(입력 후킹·워치독·종료 방어 등)는 의도적으로
-# 존재하지 않는다. 설계 원칙과 금지 목록: SPEC.md, CLAUDE.md 참고.
+# 핵심이므로, 우회를 막는 코드(입력 후킹·종료 방어·상주 감시 프로세스 등)는 의도적으로
+# 존재하지 않는다. 유일한 예외: 강제로 끄면 작업 스케줄러가 1분 안에 다시 켠다
+# (2026-11-14 사용자 결정, '자동 실행' 섹션). 설계 원칙과 금지 목록: SPEC.md, CLAUDE.md 참고.
 
 import csv
 import ctypes
@@ -69,6 +70,8 @@ DEFAULT_CONFIG = {
     "extension_cooldown_minutes": 30,    # '연속 금지'일 때 다음 5분까지 기다리는 시간
     "pause_auto_resume_minutes": 30,
     "winddown_sleep_minutes": 5,         # '오늘은 여기까지' 후 자동 절전까지의 시간
+    "autostart": False,                  # 관리자가 켜 둔 자동 실행(로그인 때 켜기 + 꺼지면 1분 안에 다시 켜기)
+    "admin_quit_minutes": 30,            # 관리자 PIN으로 끈 뒤 다시 켜지 않는 시간(exe 교체 등)
     "widget_right": None,                # 위젯 위치 기억(오른쪽 끝 x). None이면 우측 상단 기본값
     "widget_y": None,
     "profiles": [
@@ -161,6 +164,7 @@ class Store:
         # 지난 실행이 '정상 종료' 표시 없이 끝났는지 먼저 본다(current_user를 비우기 전에 —
         # 그때 누가 쓰고 있었는지가 기록에 필요하다).
         self.last_unclean = self._note_unclean_exit(now)
+        self.state["guard_off_until"] = None   # 실제로 켜졌으니 '관리자가 끈 시간'은 끝났다
         self.rollover(now)
         # 앱이 꺼져 있는 동안 일시정지 자동 재개 시간이 지났으면 정리해 둔다
         for u in self.state["users"].values():
@@ -189,6 +193,8 @@ class Store:
         c["extension_cooldown_minutes"] = as_int(c["extension_cooldown_minutes"], 30)
         c["pause_auto_resume_minutes"] = as_int(c["pause_auto_resume_minutes"], 30, lo=1)
         c["winddown_sleep_minutes"] = as_int(c["winddown_sleep_minutes"], 5, lo=1)
+        c["admin_quit_minutes"] = as_int(c["admin_quit_minutes"], 30, lo=1)
+        c["autostart"] = bool(c["autostart"])
         for key in ("widget_right", "widget_y"):   # 위젯 위치: 정수 또는 None
             if not isinstance(c[key], int) or isinstance(c[key], bool):
                 c[key] = None
@@ -252,6 +258,8 @@ class Store:
             s["current_user"] = None
         if not isinstance(s.get("alive"), dict):
             s["alive"] = None
+        if not isinstance(s.get("guard_off_until"), str):
+            s["guard_off_until"] = None
         exits = s.get("unclean_exits") if isinstance(s.get("unclean_exits"), list) else []
         s["unclean_exits"] = [e for e in exits if isinstance(e, dict)][-UNCLEAN_KEEP:]
 
@@ -274,6 +282,13 @@ class Store:
         self._session_end_at = now or datetime.now()
         self.state["alive"] = None
         self.save_state()
+
+    def admin_quit(self, now=None):
+        """관리자 PIN으로 끌 때. 작업 스케줄러가 곧바로 다시 켜지 않도록 쉬는 시간을 남긴다."""
+        now = now or datetime.now()
+        until = now + timedelta(minutes=self.config["admin_quit_minutes"])
+        self.state["guard_off_until"] = until.isoformat(timespec="seconds")
+        self.mark_clean_exit(now)
 
     def _note_unclean_exit(self, now):
         alive = self.state["alive"]
@@ -541,7 +556,9 @@ def make_draggable(win, *handles, on_move=None):
         win._drag = (e.x_root - win.winfo_x(), e.y_root - win.winfo_y())
     def move(e):
         dx, dy = getattr(win, "_drag", (0, 0))
-        win.geometry(f"+{e.x_root - dx}+{e.y_root - dy}")
+        # CTk의 geometry()는 위치만 줘도 그때의 크기를 같이 고정해 버려서, 이후 문구가 길어져도
+        # 창이 안 늘어난다. 위치만 바꿀 때는 Tk 원래 메서드(wm_geometry)를 쓴다.
+        win.wm_geometry(f"+{e.x_root - dx}+{e.y_root - dy}")
         if on_move:
             on_move()
     for h in handles:
@@ -570,6 +587,19 @@ def primary_screen():
         gsm = ctypes.windll.user32.GetSystemMetrics
         return gsm(0), gsm(1)  # SM_CXSCREEN, SM_CYSCREEN
     return None, None
+
+
+def on_a_monitor(x, y):
+    """(x, y)가 지금 연결된 모니터 어딘가에 있는가. 듀얼 모니터의 두 번째 화면도 포함한다.
+    모니터를 떼어 낸 뒤 그 자리를 가리키는 저장 위치는 False — 보이지 않는 곳에 위젯을 띄우지 않게."""
+    if not IS_WINDOWS:
+        return True
+    class POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+    mfp = ctypes.windll.user32.MonitorFromPoint
+    mfp.argtypes = [POINT, ctypes.c_uint]
+    mfp.restype = ctypes.c_void_p
+    return bool(mfp(POINT(int(x), int(y)), 0))   # MONITOR_DEFAULTTONULL
 
 
 def in_background(fn):
@@ -664,6 +694,7 @@ def ask_pin(master, title, subtitle="", verify=None, confirm_new=False):
     ctk.CTkButton(row, text="취소", width=90, font=f(13), fg_color=C["border"],
                   hover_color="#475569", command=cancel).pack(side="left", padx=4)
     entry.bind("<Return>", done)
+    entry.bind("<Escape>", lambda e: cancel())
     center_window(dlg)
     entry.focus_force()
     dlg.grab_set()
@@ -699,6 +730,9 @@ class Banner:
 # ── 잔여시간 위젯: 항상 보이는 것이 이 앱의 핵심 기능 ─────────────────────
 
 class RemainWidget:
+    """이름과 분만 보이는 작은 알약. 마우스를 올리면 자세한 문구로 펼쳐진다.
+    게임 화면을 덜 가리도록 폭을 줄였다(2026-11-14). 색 단계는 그대로다(SPEC 5절)."""
+
     def __init__(self, app):
         self.app = app
         self.win = ctk.CTkToplevel(app.root)
@@ -707,25 +741,43 @@ class RemainWidget:
         # Alt+F4로도 닫히지 않게 막는다. 위젯만 닫히고 프로그램은 백그라운드에 남으면
         # '보이지도 않고 새로 켜지지도 않는' 상태가 된다 — 항상 보이는 것이 핵심 기능이라 이걸 막는다.
         self.win.protocol("WM_DELETE_WINDOW", lambda: None)
-        self.card = ctk.CTkFrame(self.win, corner_radius=19, fg_color=C["card"],
+        self.card = ctk.CTkFrame(self.win, corner_radius=15, fg_color=C["card"],
                                  border_width=1, border_color=C["border"])
         self.card.pack(padx=2, pady=2)
-        self.label = ctk.CTkLabel(self.card, text="…", font=f(14, True), text_color=C["text"])
-        self.label.pack(padx=18, pady=9)
-        make_draggable(self.win, self.card, self.label,   # 게임 UI를 가리면 짜증만 남는다
-                       on_move=self._save_anchor)
-        for w in (self.card, self.label):
+        inner = ctk.CTkFrame(self.card, fg_color="transparent")
+        inner.pack(padx=12, pady=5)
+        self.name = ctk.CTkLabel(inner, text="", font=f(13), text_color=C["sub"])
+        self.name.pack(side="left")
+        self.value = ctk.CTkLabel(inner, text="…", font=f(14, True), text_color=C["text"])
+        self.value.pack(side="left", padx=(7, 0))
+        self.expanded = False
+        handles = (self.card, inner, self.name, self.value)
+        make_draggable(self.win, *handles, on_move=self._save_anchor)   # 게임 UI를 가리면 짜증만 남는다
+        for w in handles:
             w.bind("<Button-3>", self.menu)
             w.bind("<Double-Button-1>", lambda e: self.app.show_dashboard())
             w.bind("<ButtonRelease-1>", self._persist)   # 옮긴 자리를 기억한다
+            w.bind("<Enter>", lambda e: self._hover(True))
+            w.bind("<Leave>", lambda e: self.win.after(80, self._check_leave))
         # 문구 길이가 바뀌어도 오른쪽 끝을 기준으로 제자리에 붙어 있게 앵커를 기억한다.
-        # 지난번에 옮긴 자리가 있으면 거기서 시작하고, 없으면 우측 상단 기본값.
+        # 지난번에 옮긴 자리가 있으면 거기서 시작하고, 없으면 주 모니터 우측 상단 기본값.
+        # 예전엔 '화면 밖으로 안 나가게' 주 모니터 폭으로 조였는데, 그 때문에 두 번째 모니터에
+        # 둔 위젯이 켤 때마다 주 모니터 끝으로 끌려왔다. 이제는 그 자리가 실제 모니터 위인지만 본다.
         cfg = self.app.store.config
-        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
-        self._right = cfg["widget_right"] if cfg["widget_right"] is not None else sw - 16
-        self._y = cfg["widget_y"] if cfg["widget_y"] is not None else 16
-        self._right = min(max(60, self._right), sw)      # 화면 밖으로 나가지 않게 살짝 조인다
-        self._y = min(max(0, self._y), max(0, sh - 40))
+        right, y = cfg["widget_right"], cfg["widget_y"]
+        if right is None or y is None or not on_a_monitor(right - 20, y + 10):
+            right, y = self.win.winfo_screenwidth() - 16, 16
+        self._right, self._y = right, y
+        self._last_w = 0
+        self.win.bind("<Configure>", self._on_configure, add="+")   # CTk 자체 바인딩을 덮지 않게
+        # CTk는 화면 배율을 맞출 때(_set_scaling) 창 크기를 그 순간의 크기로 묶어 버린다
+        # (minsize=maxsize=현재 크기 + 'WxH' 지정). 그러면 문구가 길어져도 창이 안 늘어나
+        # 글자가 잘린다. 배율을 맞춘 직후 다시 풀어 내용 크기를 따르게 한다.
+        orig_scaling = self.win._set_scaling
+        def rescaled(*a, **k):
+            orig_scaling(*a, **k)
+            self.win.after(1100, self.refresh)   # CTk가 1초 뒤 min/max를 한 번 더 건드린다
+        self.win._set_scaling = rescaled
         self.refresh()
 
     def _save_anchor(self):
@@ -736,38 +788,74 @@ class RemainWidget:
     def _persist(self, _=None):
         self._save_anchor()
         cfg = self.app.store.config
-        cfg["widget_right"], cfg["widget_y"] = self._right, self._y
-        self.app.store.save_config()
+        if (cfg["widget_right"], cfg["widget_y"]) != (self._right, self._y):
+            cfg["widget_right"], cfg["widget_y"] = self._right, self._y
+            self.app.store.save_config()
 
-    def refresh(self):
+    def _hover(self, on):
+        if self.expanded != on:
+            self.expanded = on
+            self.refresh()
+
+    def _check_leave(self):
+        # 위젯 안의 다른 칸으로 옮겨 갈 때도 Leave가 온다. 정말 밖으로 나갔을 때만 접는다.
+        if not self.win.winfo_exists():
+            return
+        px, py = self.win.winfo_pointerxy()
+        x, y = self.win.winfo_rootx(), self.win.winfo_rooty()
+        if not (x <= px < x + self.win.winfo_width() and y <= py < y + self.win.winfo_height()):
+            self._hover(False)
+
+    def texts(self):
+        """(이름, 짧은 값, 펼친 값, 배경, 값 글자색)"""
         s = self.app.store
         pid = s.state["current_user"]
-        bg, border, txcolor = C["card"], C["border"], C["text"]
         if pid is None or s.profile(pid) is None:
-            text = "사용자를 선택해 주세요"
-            txcolor = C["sub"]
+            return "", "선택 전", "누가 쓰는지 골라 주세요", C["card"], C["sub"]
+        p, u = s.profile(pid), s.user(pid)
+        if u["paused"]:
+            left = s.pause_resume_left(pid)
+            # ⏸ 같은 기호는 Tk 글꼴에서 네모로 깨져서 글자만 쓴다
+            return p["name"], "쉬는 중", f"쉬는 중 · {left}분 뒤 다시 시작", C["pause_bg"], C["text"]
+        if p["no_limit"]:
+            return p["name"], "∞", f"한도 없음 · 오늘 {u['used_minutes']}분 사용", C["card"], C["text"]
+        rem = s.remaining(pid)
+        if rem <= 0:
+            return p["name"], "0분", "오늘 시간이 끝났어요", C["over_bg"], C["over_tx"]
+        bg, tx = (C["over_bg"], C["over_tx"]) if rem <= 3 else \
+                 (C["warn_bg"], C["warn_tx"]) if rem <= 10 else (C["card"], C["text"])
+        return p["name"], f"{rem}분", f"{rem}분 남음 · 오늘 {u['used_minutes']}분 사용", bg, tx
+
+    def refresh(self):
+        name, short, long_, bg, tx = self.texts()
+        self.card.configure(fg_color=bg)
+        self.name.configure(text=name, text_color=tx if bg != C["card"] else C["sub"])
+        if name:
+            self.name.pack(side="left", before=self.value)   # 숨겼다 다시 보일 때도 값 앞에
+            self.value.pack_configure(padx=(7, 0))
         else:
-            p, u = s.profile(pid), s.user(pid)
-            if u["paused"]:
-                text = f"{p['name']} · 일시정지 중 · {s.pause_resume_left(pid)}분 후 다시 시작"
-                bg = C["pause_bg"]
-            elif p["no_limit"]:
-                text = f"{p['name']} · 오늘 {u['used_minutes']}분째 사용 중"
-            else:
-                rem = s.remaining(pid)
-                if rem <= 0:
-                    text, bg, txcolor = f"{p['name']} · 오늘 시간이 끝났어요", C["over_bg"], C["over_tx"]
-                elif rem <= 3:
-                    text, bg, txcolor = f"{p['name']} · {rem}분 남음", C["over_bg"], C["over_tx"]
-                elif rem <= 10:
-                    text, bg, txcolor = f"{p['name']} · {rem}분 남음", C["warn_bg"], C["warn_tx"]
-                else:
-                    text = f"{p['name']} · {rem}분 남음"
-        self.card.configure(fg_color=bg, border_color=border)
-        self.label.configure(text=text, text_color=txcolor)
+            self.name.pack_forget()
+            self.value.pack_configure(padx=0)
+        self.value.configure(text=long_ if self.expanded else short, text_color=tx)
+        self._unfreeze()
         self.win.update_idletasks()
-        self.win.geometry(f"+{max(0, self._right - self.win.winfo_reqwidth())}+{self._y}")
+        self.win.wm_geometry(f"+{self._right - self.win.winfo_reqwidth()}+{self._y}")   # make_draggable 주석 참고
         self.win.attributes("-topmost", True)  # 다른 topmost 창에 밀리지 않게 주기적으로 갱신
+
+    def _unfreeze(self):
+        # 위 __init__ 주석 참고. 크기 지정을 비우면('') 창이 다시 내용 크기를 따른다.
+        self.win.wm_minsize(1, 1)
+        self.win.wm_maxsize(10000, 10000)
+        self.win.wm_geometry("")
+
+    def _on_configure(self, _=None):
+        # CTk 글자 칸은 폭을 한 박자 늦게 확정한다. 위 refresh의 첫 자리 계산은 그 전 폭이라
+        # 펼치거나 문구가 바뀌면 오른쪽 끝(기억한 자리)이 밀렸다. 창 폭이 실제로 바뀔 때마다
+        # 오른쪽 끝에 다시 붙인다. 드래그는 폭이 그대로라 여기서 건드리지 않는다.
+        w = self.win.winfo_width()
+        if w > 1 and w != self._last_w:
+            self._last_w = w
+            self.win.wm_geometry(f"+{self._right - w}+{self._y}")
 
     def menu(self, event):
         s = self.app.store
@@ -820,13 +908,36 @@ class Picker:
                      font=f(14), text_color=C["sub"]).pack(pady=(0, 22))
         s = app.store
         for p in s.config["profiles"]:
-            u = s.user(p["id"])
-            info = f"오늘 {u['used_minutes']}분 사용" if u["used_minutes"] else "오늘 처음이에요"
-            ctk.CTkButton(box, text=f"{p['name']}   ·   {info}", font=f(16),
-                          height=50, width=360, anchor="w", corner_radius=12,
-                          fg_color="#273449", hover_color=C["accent"],
-                          command=lambda pid=p["id"]: self.choose(pid)).pack(pady=6)
+            self._row(box, p)
         # '나중에 고를게요' 같은 건너뛰기 버튼을 두지 않는다 — 고르기 전엔 넘어갈 수 없다.
+
+    def _row(self, box, p):
+        """한 사람 카드: 왼쪽 이름(굵게), 오른쪽 오늘 남은 시간. 카드 어디를 눌러도 고른다.
+        아이에게 필요한 건 '얼마나 썼나'보다 '얼마나 남았나'라서 남은 시간을 보여준다."""
+        s = self.app.store
+        u = s.user(p["id"])
+        if p["no_limit"]:
+            info, tone = (f"오늘 {u['used_minutes']}분 사용" if u["used_minutes"] else "한도 없음"), C["sub"]
+        else:
+            rem = s.remaining(p["id"])
+            info, tone = (f"{rem}분 남음", C["accent2"]) if rem > 0 else ("오늘은 다 썼어요", C["danger"])
+        base, hover = "#273449", "#334a6b"
+        row = ctk.CTkFrame(box, fg_color=base, corner_radius=12, width=380, height=54, cursor="hand2")
+        row.pack(pady=5)
+        row.pack_propagate(False)
+        name = ctk.CTkLabel(row, text=p["name"], font=f(17, True), text_color=C["text"])
+        name.pack(side="left", padx=(18, 0))
+        if p["pin_hash"]:
+            ctk.CTkLabel(row, text="PIN", font=f(10), text_color=C["sub"]).pack(side="left", padx=(8, 0))
+        val = ctk.CTkLabel(row, text=info, font=f(14), text_color=tone)
+        val.pack(side="right", padx=(0, 18))
+        def paint(color):
+            if row.winfo_exists():
+                row.configure(fg_color=color)
+        for w in [row] + list(row.winfo_children()):
+            w.bind("<Button-1>", lambda e, pid=p["id"]: self.choose(pid))
+            w.bind("<Enter>", lambda e: paint(hover))
+            w.bind("<Leave>", lambda e: paint(base))
 
     def refresh(self):
         self.win.attributes("-topmost", True)   # 다른 topmost 창에 밀리지 않게 유지
@@ -1080,7 +1191,9 @@ class Dashboard:
         self.canvas = tk.Canvas(self.win, bg=C["bg"], highlightthickness=0, height=260)
         self.canvas.pack(fill="both", expand=True, padx=20, pady=(4, 10))
         self.refresh()
-        self.win.bind("<Configure>", lambda e: self.draw_chart() if e.widget is self.win else None)
+        # 캔버스 자체의 크기 변화를 따라 다시 그린다. 예전엔 창의 <Configure>를 걸었는데,
+        # CTk 창에서는 그 조건이 맞지 않아 그래프가 처음 폭(300px)에 머물렀다.
+        self.canvas.bind("<Configure>", lambda e: self.draw_chart())
 
     def refresh(self):
         names = [p["name"] for p in self.app.store.config["profiles"]]
@@ -1311,8 +1424,13 @@ class Settings:
         return "자동 실행: 해제하기" if is_autostart_enabled() else "자동 실행: 등록하기"
 
     def toggle_autostart(self):
-        ok, err = set_autostart(not is_autostart_enabled())
-        if not ok:
+        enable = not is_autostart_enabled()
+        ok, err = set_autostart(enable)
+        if ok:
+            # 관리자의 뜻을 설정에 남긴다. 켜 둔 상태면 작업이 지워져도 다음 실행 때 다시 만든다.
+            self.app.store.config["autostart"] = enable
+            self.app.store.save_config()
+        else:
             messagebox.showinfo(APP_ID, f"자동 실행 설정이 잘 안 됐어요.\n{err}", parent=self.win)
         self.auto_btn.configure(text=self.auto_label())
 
@@ -1345,48 +1463,123 @@ class Settings:
         if self.app.picker is not None and self.app.picker.win.winfo_exists():
             self.app.show_picker()   # 열려 있는 선택 창에 개명·추가·삭제를 반영
 
-# ── 자동 실행: shell:startup 바로가기. 몰래 등록하지 않는다 ─────────────────
+# ── 자동 실행 + 강제 종료 후 다시 켜기: 작업 스케줄러 ────────────────────────
+#
+# 2026-11-14 사용자 결정(SPEC 11·12절): 아이가 작업 관리자로 키퍼를 반복해서 끄는 일이
+# 기록으로 확인되어, '강제로 끄면 1분 안에 다시 켜진다'를 넣었다. 원래 금지 목록의
+# '워치독'에 해당하므로 일부러 가장 단순하고 드러나는 방법을 쓴다.
+#  - 상주 감시 프로세스를 따로 두지 않는다. 윈도우 작업 스케줄러의 작업 하나가
+#    로그인 때와 1분마다 키퍼를 실행하고, 이미 돌고 있으면 새 실행은 조용히 끝난다.
+#  - 숨기지 않는다. 작업 이름은 앱 이름 그대로이고, 설명에 하는 일을 적어 둔다.
+#  - 관리자 PIN으로 끄면 정해진 시간(admin_quit_minutes) 동안은 다시 켜지 않는다.
+#  - 자동 실행 해제(설정, 관리자)는 이 작업을 지운다. 몰래 등록하지 않는다.
+
+TASK_NAME = APP_ID
+BACKGROUND_ARG = "--background"   # 작업 스케줄러가 붙이는 표시. 이미 실행 중이면 조용히 끝난다.
+
 
 def startup_lnk_path():
+    # 예전 방식(시작프로그램 바로가기). 작업 스케줄러로 옮길 때 지운다.
     return os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
                         "Start Menu", "Programs", "Startup", f"{APP_ID}.lnk")
 
 
+def launch_target():
+    """(실행 파일, 인자, 작업 폴더). exe 빌드와 .pyw 실행을 나눈다."""
+    if getattr(sys, "frozen", False):
+        return sys.executable, BACKGROUND_ARG, os.path.dirname(sys.executable)
+    script = os.path.abspath(__file__)
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")   # 콘솔 창 없이
+    target = pyw if os.path.exists(pyw) else sys.executable
+    return target, f'"{script}" {BACKGROUND_ARG}', os.path.dirname(script)
+
+
+def _run_quiet(args):
+    return subprocess.run(args, capture_output=True, creationflags=0x08000000)
+
+
 def is_autostart_enabled():
-    return IS_WINDOWS and os.path.exists(startup_lnk_path())
+    return IS_WINDOWS and _run_quiet(["schtasks", "/Query", "/TN", TASK_NAME]).returncode == 0
+
+
+def task_xml():
+    from xml.sax.saxutils import escape
+    domain, name = os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", "")
+    user = f"{domain}\\{name}" if domain else name
+    target, arguments, workdir = launch_target()
+    # ExecutionTimeLimit PT0S: 기본값(72시간)이면 사흘 켜 둔 키퍼를 스케줄러가 끝내 버린다.
+    # IgnoreNew: 이 작업이 띄운 키퍼가 돌고 있는 동안에는 1분 트리거가 새로 띄우지 않는다.
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>타임키퍼(time-keeper-windows)를 로그인할 때 켜고, 꺼져 있으면 1분 안에 다시 켭니다. 관리자 PIN으로 끈 경우에는 정해진 시간 동안 다시 켜지 않습니다. 끄려면 타임키퍼 설정의 '자동 실행: 해제하기'를 쓰세요.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{escape(user)}</UserId></LogonTrigger>
+    <TimeTrigger>
+      <Repetition><Interval>PT1M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary><Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author"><UserId>{escape(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{escape(target)}</Command><Arguments>{escape(arguments)}</Arguments><WorkingDirectory>{escape(workdir)}</WorkingDirectory></Exec>
+  </Actions>
+</Task>"""
 
 
 def set_autostart(enable):
     if not IS_WINDOWS:
         return False, "윈도우에서만 쓸 수 있어요."
-    lnk = startup_lnk_path()
     try:
+        lnk = startup_lnk_path()
+        if os.path.exists(lnk):
+            os.remove(lnk)   # 예전 바로가기가 남아 있으면 로그인 때 '이미 실행 중' 안내가 뜬다
         if not enable:
-            if os.path.exists(lnk):
-                os.remove(lnk)
-            return True, ""
-        if getattr(sys, "frozen", False):
-            # exe로 빌드된 경우: 실행 파일이 곧 진입점이라 스크립트 인자가 필요 없다.
-            target, arguments, workdir = sys.executable, "", os.path.dirname(sys.executable)
-        else:
-            # .pyw로 실행: pythonw.exe가 스크립트를 열게 한다(콘솔 창 없이).
-            script = os.path.abspath(__file__)
-            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-            target = pyw if os.path.exists(pyw) else sys.executable
-            arguments, workdir = f'"{script}"', os.path.dirname(script)
-        # 레지스트리 대신 시작프로그램 폴더: 사용자가 눈으로 확인하고 지울 수 있다.
-        q = lambda t: t.replace("'", "''")
-        ps = (f"$ws = New-Object -ComObject WScript.Shell; "
-              f"$s = $ws.CreateShortcut('{q(lnk)}'); "
-              f"$s.TargetPath = '{q(target)}'; "
-              f"$s.Arguments = '{q(arguments)}'; "
-              f"$s.WorkingDirectory = '{q(workdir)}'; "
-              f"$s.Save()")
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                       check=True, capture_output=True, creationflags=0x08000000)
-        return True, ""
-    except (OSError, subprocess.CalledProcessError) as e:
+            r = _run_quiet(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"])
+            return (True, "") if r.returncode == 0 or not is_autostart_enabled() else (False, _decode(r))
+        path = os.path.join(default_data_dir(), "task.xml")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-16") as fp:   # schtasks /XML은 UTF-16을 기대한다
+            fp.write(task_xml())
+        r = _run_quiet(["schtasks", "/Create", "/TN", TASK_NAME, "/XML", path, "/F"])
+        os.remove(path)
+        return (True, "") if r.returncode == 0 else (False, _decode(r))
+    except (OSError, subprocess.SubprocessError) as e:
         return False, str(e)
+
+
+def _decode(r):
+    for enc in ("utf-8", "cp949"):
+        try:
+            return (r.stderr or r.stdout).decode(enc).strip()
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+def ensure_autostart(store):
+    """시작할 때 한 번. 관리자가 자동 실행을 켜 둔 상태(autostart)면 작업이 있는지 확인해
+    없으면 다시 만든다(지워졌거나, 예전 바로가기 방식에서 옮겨 오는 경우). 경로도 지금 실행 파일로
+    맞춘다 — zip을 다른 폴더에 새로 풀었을 때 옛 경로를 가리키지 않게."""
+    if not IS_WINDOWS:
+        return
+    cfg = store.config
+    if not cfg["autostart"] and os.path.exists(startup_lnk_path()):
+        cfg["autostart"] = True   # 예전 방식으로 켜 둔 집: 관리자가 이미 켠 것이므로 그대로 옮긴다
+        store.save_config()
+    if cfg["autostart"]:
+        set_autostart(True)
 
 # ── 앱 본체: 60초 틱, 창들 사이의 교통정리 ─────────────────────────────────
 
@@ -1542,7 +1735,12 @@ class App:
             return
         # 사용 시간은 매 틱마다 이미 저장돼 있다. 그대로 창을 닫으면 mainloop이 끝나고
         # 프로세스가 종료되며 단일 실행 뮤텍스도 풀린다.
-        s.mark_clean_exit()   # 관리자가 끈 것은 '정상적으로 꺼지지 않은 때'에 남기지 않는다
+        # 관리자가 끈 것은 '정상적으로 꺼지지 않은 때'에 남기지 않고, 정해진 시간 동안은
+        # 작업 스케줄러가 다시 켜지 않는다(exe 교체 등). 그 뒤로는 1분 안에 다시 켜진다.
+        s.admin_quit()
+        if s.config["autostart"]:
+            messagebox.showinfo(APP_ID, f"타임키퍼를 껐어요.\n{s.config['admin_quit_minutes']}분 뒤에 "
+                                        "자동으로 다시 켜져요. 그동안 다시 쓰려면 직접 실행해 주세요.")
         self.root.destroy()
 
     def close_winddown(self):
@@ -1677,8 +1875,24 @@ def shut_down_last():
             pass
 
 
+def guard_paused(now=None):
+    """작업 스케줄러가 띄운 실행(--background)이 지금 켜지면 안 되는가 — 관리자가 끈 직후.
+    Store를 만들지 않고 파일만 읽는다. Store는 '지난 실행이 정상 종료였나'를 판정·기록하므로,
+    켜지지도 않을 실행이 그걸 건드리면 안 된다."""
+    st = load_json(os.path.join(default_data_dir(), "state.json"), {})
+    try:
+        return (now or datetime.now()) < datetime.fromisoformat(st.get("guard_off_until"))
+    except (TypeError, ValueError):
+        return False
+
+
 def main():
+    # 작업 스케줄러는 1분마다 --background로 실행한다. 이미 돌고 있거나 관리자가 막 끈 경우에는
+    # 아무것도 띄우지 않고 조용히 끝난다(1분마다 안내 창이 뜨면 안 된다).
+    background = BACKGROUND_ARG in sys.argv[1:]
     if ctk is None:
+        if background:
+            return
         root = tk.Tk()
         root.withdraw()
         messagebox.showinfo(APP_ID, "필요한 패키지가 아직 없어요.\n"
@@ -1686,21 +1900,27 @@ def main():
                             "pip install customtkinter")
         return
     if already_running():
+        if background:
+            return
         root = tk.Tk()
         root.withdraw()
         # 위젯이 안 보이는데 이 메시지가 뜨면, 이전 실행이 백그라운드에 남은 것이다.
-        # 이 앱은 작업표시줄에 안 뜨고 작업관리자의 '자세히' 탭에만 pythonw.exe로 보이므로
+        # 이 앱은 작업표시줄에 안 뜨고 작업관리자의 '자세히' 탭에만 보이므로
         # 어디서 끝내야 하는지 구체적으로 안내한다.
         messagebox.showinfo(APP_ID,
                             "이미 실행되고 있어요. 화면 오른쪽 위의 위젯을 확인해 주세요.\n\n"
                             "위젯이 보이지 않으면 이전 프로그램이 백그라운드에 남아 있을 수 있어요.\n"
-                            "작업 관리자(Ctrl+Shift+Esc)의 '자세히' 탭에서 pythonw.exe를 끝낸 뒤\n"
-                            "다시 실행해 주세요.")
+                            "작업 관리자(Ctrl+Shift+Esc)의 '자세히' 탭에서 time-keeper-windows.exe\n"
+                            "(파이썬으로 실행했다면 pythonw.exe)를 끝내면 1분 안에 새로 켜져요.")
+        return
+    if background and guard_paused():
         return
     shut_down_last()
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    app = App(Store())
+    store = Store()
+    ensure_autostart(store)
+    app = App(store)
     app.root.mainloop()
 
 
